@@ -2,6 +2,8 @@ name: Compile Choice B Bluetooth Launcher
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
 
 jobs:
   build:
@@ -41,36 +43,21 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Compile and Sign APK
         working-directory: ./launcher
         run: |
+          chmod +x gradlew 2>/dev/null || true
           if [ -f "./gradlew" ]; then
-            chmod +x gradlew
-            ./gradlew assembleDebug
-          elif [ -f "app/build.gradle" ] || [ -f "build.gradle" ]; then
-            gradle assembleDebug
+            ./gradlew assembleDebug assembleRelease
           else
-            BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | tail -n 1)
-            PLATFORM=$(ls -d $ANDROID_HOME/platforms/* | tail -n 1)
-            mkdir -p build/gen build/obj build/apk
-            $BUILD_TOOLS/aapt package -f -m -J build/gen -M app/src/main/AndroidManifest.xml -S app/src/main/res -I $PLATFORM/android.jar
-            find app/src/main/java build/gen -name "*.java" > build/sources.txt
-            javac -source 1.8 -target 1.8 -bootclasspath $PLATFORM/android.jar -d build/obj @build/sources.txt
-            $BUILD_TOOLS/d8 --lib $PLATFORM/android.jar --output build/apk $(find build/obj -name "*.class")
-            $BUILD_TOOLS/aapt package -f -M app/src/main/AndroidManifest.xml -S app/src/main/res -I $PLATFORM/android.jar -F build/apk/unsigned.apk
-            cd build/apk && $BUILD_TOOLS/aapt add unsigned.apk classes.dex && cd ../..
-            $BUILD_TOOLS/zipalign -f 4 build/apk/unsigned.apk build/apk/aligned.apk
-            keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
-            $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android --out build/apk/cleanyourtv-bt.apk build/apk/aligned.apk
+            gradle assembleDebug assembleRelease
           fi
 
       - name: Collect Signed APK
         run: |
           mkdir -p out_apk
-          find launcher -name "*.apk" ! -name "*unsigned*" ! -name "*aligned*" -exec cp {} out_apk/cleanyourtv-bt.apk \;
+          cp $(find launcher -name "*-debug.apk" | head -n 1) out_apk/cleanyourtv-bt.apk
+          ls -lh out_apk/
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
