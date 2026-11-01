@@ -1,4 +1,4 @@
-name: Compile Stable Merged CleanYourTV APK
+name: Compile Working Merged CleanYourTV APK (v3.2 + PR 311)
 
 on:
   workflow_dispatch:
@@ -16,43 +16,26 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Merge PR #311 Bluetooth Pill Cleanly Onto v3.2
+      - name: Set up JDK 17 First
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Merge PR #311 Bluetooth Pill with 3-Way diff3 & Permission Lock
         run: |
           git config user.name "Builder"
           git config user.email "builder@users.noreply.github.com"
           git fetch origin pull/311/head:pr-311
 
           BASE_COMMIT=$(git merge-base main pr-311)
-          git format-patch $BASE_COMMIT..pr-311 --stdout > pr311.patch
-          git apply --3way --ignore-space-change --ignore-whitespace pr311.patch || true
-
-          git checkout main -- launcher/app/src/main/java/com/gathin/tvhome/HomeKeyService.java
+          echo "Base commit: $BASE_COMMIT"
 
           python3 - << 'PYEOF'
-          import glob, os, re, subprocess
+          import difflib, glob, os, re, subprocess
 
-          for path in glob.glob("launcher/**/*", recursive=True):
-              if not os.path.isfile(path) or path.endswith(".java"):
-                  continue
-              try:
-                  txt = open(path, "r", encoding="utf-8").read()
-              except Exception:
-                  continue
-              if "<<<<<<<" not in txt:
-                  continue
-              def resolve_xml(m):
-                  ours, theirs = m.group(1), m.group(2)
-                  if "bluetooth" in theirs.lower() or "bt" in theirs.lower():
-                      return ours + theirs
-                  return ours
-              txt = re.sub(r"<<<<<<<[^\n]*\n(.*?)=======\n(.*?)>>>>>>>[^\n]*\n", resolve_xml, txt, flags=re.DOTALL)
-              open(path, "w", encoding="utf-8").write(txt)
-
-          java_conflicts = {}
-          for path in glob.glob("launcher/**/*.java", recursive=True):
-              txt = open(path, "r", encoding="utf-8").read()
-              if "<<<<<<<" in txt:
-                  java_conflicts[path] = txt
+          base_commit = subprocess.check_output(["git", "merge-base", "main", "pr-311"], text=True).strip()
+          changed_files = subprocess.check_output(["git", "diff", "--name-only", base_commit, "pr-311"], text=True).splitlines()
 
           def strip_sc(s):
               s = re.sub(r'//.*?$', '', s, flags=re.MULTILINE)
@@ -64,76 +47,151 @@ jobs:
               c = strip_sc(s)
               return c.count("{") - c.count("}")
 
-          def render_java(raw_text, fallback_indices):
-              idx = 0
-              def repl(m):
-                  nonlocal idx
-                  cur = idx
-                  idx += 1
-                  ours, theirs = m.group(1), m.group(2)
-                  if cur in fallback_indices:
-                      return ours
-                  if "bluetooth" not in theirs.lower() and "bt" not in theirs.lower():
-                      return ours
-                  if b_delta(theirs) != 0:
-                      return ours
-                  method_split = re.search(r'(\n[ \t]*\}\s*\n+[ \t]*(?:private|public|protected)\s+)', ours)
-                  has_method_in_theirs = re.search(r'^\s*(?:private|public|protected)\s+', theirs, flags=re.MULTILINE)
-                  if method_split and not has_method_in_theirs:
-                      pos = method_split.start(1)
-                      return ours[:pos] + "\n" + theirs.rstrip("\n") + ours[pos:]
-                  if b_delta(ours) == 0:
-                      return ours + theirs
-                  return ours
-              return re.sub(r"<<<<<<<[^\n]*\n(.*?)=======\n(.*?)>>>>>>>[^\n]*\n", repl, raw_text, flags=re.DOTALL)
+          def split_at_method_boundary(text):
+              # Splits a conflict chunk if it closes the current method with '}' and starts a new class member
+              m = re.search(r'(\n[ \t]*\}\s*\n+)([ \t]*(?:@Override\s*\n[ \t]*)?(?:private|public|protected|void|boolean|int|String)\s+)', text)
+              if m:
+                  pos = m.start(1)
+                  close_brace = m.group(1)
+                  return text[:pos], close_brace, text[m.end(1):]
+              return None
 
-          fallback_map = {p: set() for p in java_conflicts}
-          for p, raw in java_conflicts.items():
-              open(p, "w", encoding="utf-8").write(render_java(raw, fallback_map[p]))
+          for f in changed_files:
+              if "HomeKeyService.java" in f:
+                  print(f"Skipping {f} (keeping v3.2 main)")
+                  continue
 
-          os.chmod("launcher/gradlew", 0o755)
-          for attempt in range(1, 6):
-              proc = subprocess.run(["./gradlew", "compileDebugJavaWithJavac"], cwd="launcher", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-              if proc.returncode == 0:
-                  break
-              for p, raw in java_conflicts.items():
-                  num_blocks = len(re.findall(r"<<<<<<<", raw))
-                  for b in range(num_blocks):
-                      if b not in fallback_map[p]:
-                          fallback_map[p].add(b)
-                          break
-                  open(p, "w", encoding="utf-8").write(render_java(raw, fallback_map[p]))
-          else:
-              for p in java_conflicts:
-                  subprocess.run(["git", "checkout", "main", "--", p])
-          PYEOF
+              in_base = subprocess.run(["git", "cat-file", "-e", f"{base_commit}:{f}"], stderr=subprocess.DEVNULL).returncode == 0
+              in_main = subprocess.run(["git", "cat-file", "-e", f"main:{f}"], stderr=subprocess.DEVNULL).returncode == 0
+              in_pr = subprocess.run(["git", "cat-file", "-e", f"pr-311:{f}"], stderr=subprocess.DEVNULL).returncode == 0
 
-      - name: Ensure Code Shrinking Is Disabled for Full Bluetooth Compatibility
-        working-directory: ./launcher
-        run: |
-          python3 - << 'EOF'
-          import os, re
-          gradle_file = "app/build.gradle"
+              if not in_pr:
+                  continue
+              if not in_main:
+                  os.makedirs(os.path.dirname(f), exist_ok=True)
+                  content = subprocess.check_output(["git", "show", f"pr-311:{f}"])
+                  open(f, "wb").write(content)
+                  print(f"Added new file from PR #311: {f}")
+                  continue
+              if not in_base:
+                  content = subprocess.check_output(["git", "show", f"pr-311:{f}"])
+                  open(f, "wb").write(content)
+                  continue
+
+              open("/tmp/ours", "wb").write(subprocess.check_output(["git", "show", f"main:{f}"]))
+              open("/tmp/base", "wb").write(subprocess.check_output(["git", "show", f"{base_commit}:{f}"]))
+              open("/tmp/theirs", "wb").write(subprocess.check_output(["git", "show", f"pr-311:{f}"]))
+
+              proc = subprocess.run(["git", "merge-file", "--diff3", "-p", "/tmp/ours", "/tmp/base", "/tmp/theirs"], stdout=subprocess.PIPE)
+              merged = proc.stdout.decode("utf-8", errors="replace")
+
+              if "<<<<<<<" in merged:
+                  print(f"Resolving 3-way conflict in {f}")
+                  def resolve_diff3(m):
+                      ours, base, theirs = m.group(1), m.group(2), m.group(3)
+                      if not f.endswith(".java"):
+                          # XML / Gradle: subtract base lines from theirs so tags aren't duplicated
+                          base_set = set(line.strip() for line in base.splitlines() if line.strip())
+                          added_theirs = "".join(line for line in theirs.splitlines(True) if line.strip() not in base_set)
+                          return ours + added_theirs
+
+                      # Java 3-way resolution: strip common prefix & suffix with base
+                      o_lines = ours.splitlines(True)
+                      b_lines = base.splitlines(True)
+                      t_lines = theirs.splitlines(True)
+
+                      p = 0
+                      while p < min(len(o_lines), len(b_lines), len(t_lines)) and o_lines[p].strip() == b_lines[p].strip() == t_lines[p].strip():
+                          p += 1
+
+                      s = 0
+                      while s < min(len(o_lines) - p, len(b_lines) - p, len(t_lines) - p) and o_lines[-1 - s].strip() == b_lines[-1 - s].strip() == t_lines[-1 - s].strip():
+                          s += 1
+
+                      prefix = "".join(o_lines[:p])
+                      suffix = "".join(o_lines[len(o_lines) - s:]) if s > 0 else ""
+                      o_mid = "".join(o_lines[p:len(o_lines) - s if s > 0 else len(o_lines)])
+                      b_mid = "".join(b_lines[p:len(b_lines) - s if s > 0 else len(b_lines)])
+                      t_mid = "".join(t_lines[p:len(t_lines) - s if s > 0 else len(t_lines)])
+
+                      # If both branches closed a method and added new methods at the end of a block
+                      o_split = split_at_method_boundary(o_mid)
+                      t_split = split_at_method_boundary(t_mid)
+                      if o_split and t_split:
+                          return prefix + o_split[0] + "\n" + t_split[0] + o_split[1] + o_split[2] + "\n" + t_split[2] + suffix
+                      elif o_split and not t_split and b_delta(t_mid) == 0:
+                          if re.search(r'^\s*(?:private|public|protected)\s+', t_mid, flags=re.MULTILINE):
+                              return prefix + o_mid + "\n" + t_mid + suffix
+                          else:
+                              return prefix + o_split[0] + "\n" + t_mid + o_split[1] + o_split[2] + suffix
+
+                      # Extract only lines added by PR #311 relative to base_mid
+                      b_mid_lines = b_mid.splitlines(True)
+                      t_mid_lines = t_mid.splitlines(True)
+                      sm = difflib.SequenceMatcher(None, [x.strip() for x in b_mid_lines], [x.strip() for x in t_mid_lines])
+                      pr_added = []
+                      for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                          if tag in ("insert", "replace"):
+                              pr_added.extend(t_mid_lines[j1:j2])
+                      pr_delta = "".join(pr_added)
+
+                      if b_delta(o_mid + pr_delta) == b_delta(b_mid):
+                          return prefix + o_mid + pr_delta + suffix
+                      if b_delta(t_mid) == b_delta(b_mid) and ("bluetooth" in t_mid.lower() or "bt" in t_mid.lower()):
+                          return prefix + t_mid + suffix
+                      return prefix + o_mid + suffix
+
+                  merged = re.sub(
+                      r"<<<<<<<[^\n]*\n(.*?)\|\|\|\|\|\|\|[^\n]*\n(.*?)=======\n(.*?)>>>>>>>[^\n]*\n",
+                      resolve_diff3,
+                      merged,
+                      flags=re.DOTALL
+                  )
+
+              open(f, "w", encoding="utf-8").write(merged)
+
+          # Explicitly lock all 6 Bluetooth permissions into AndroidManifest.xml
+          manifest_path = "launcher/app/src/main/AndroidManifest.xml"
+          m_txt = open(manifest_path, "r", encoding="utf-8").read()
+          required_perms = [
+              "android.permission.BLUETOOTH",
+              "android.permission.BLUETOOTH_ADMIN",
+              "android.permission.BLUETOOTH_CONNECT",
+              "android.permission.BLUETOOTH_SCAN",
+              "android.permission.ACCESS_FINE_LOCATION",
+              "android.permission.ACCESS_COARSE_LOCATION",
+          ]
+          inject_block = ""
+          for perm in required_perms:
+              if perm not in m_txt:
+                  inject_block += f'    <uses-permission android:name="{perm}" />\n'
+          if inject_block:
+              m_txt = re.sub(r'(<manifest[^>]*>\s*\n)', r'\1' + inject_block, m_txt, count=1)
+              open(manifest_path, "w", encoding="utf-8").write(m_txt)
+              print("Injected missing Bluetooth permissions into AndroidManifest.xml")
+
+          # Force Bluetooth pill config flags to default true and disable code shrinking
+          for java_file in glob.glob("launcher/app/src/main/java/**/*.java", recursive=True):
+              jtxt = open(java_file, "r", encoding="utf-8").read()
+              for key in ["show_bluetooth", "bluetooth_pill", "show_bluetooth_pill"]:
+                  jtxt = re.sub(rf'(optBoolean\(\s*"{key}"\s*,\s*)false(\s*\))', r'\g<1>true\g<2>', jtxt)
+              open(java_file, "w", encoding="utf-8").write(jtxt)
+
+          gradle_file = "launcher/app/build.gradle"
           if os.path.exists(gradle_file):
-              g = open(gradle_file).read()
+              g = open(gradle_file, "r", encoding="utf-8").read()
               g = re.sub(r'minifyEnabled\s+true', 'minifyEnabled false', g)
               g = re.sub(r'shrinkResources\s+true', 'shrinkResources false', g)
-              open(gradle_file, "w").write(g)
-          EOF
+              open(gradle_file, "w", encoding="utf-8").write(g)
+          PYEOF
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Compile & Sign Stable APK
+      - name: Compile & Sign Uncompressed Merged APK
         working-directory: ./launcher
         run: |
-          chmod +x gradlew 2>/dev/null || true
+          chmod +x gradlew
           ./gradlew clean assembleDebug
 
-          RAW_APK="app/build/outputs/apk/debug/app-debug.apk"
+          RAW_APK=$(find app/build/outputs/apk -name "*.apk" | sort | head -n 1)
           BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
 
           $BUILD_TOOLS/zipalign -f -p 4 "$RAW_APK" aligned.apk
@@ -142,9 +200,9 @@ jobs:
           $BUILD_TOOLS/apksigner sign --ks release.keystore --ks-pass pass:android --key-pass pass:android --out ../out_apk/cleanyourtv-bt.apk aligned.apk
           ls -lh ../out_apk/cleanyourtv-bt.apk
 
-      - name: Upload Stable Merged APK
+      - name: Upload Working Merged APK
         uses: actions/upload-artifact@v4
         with:
-          name: CleanYourTV-Stable-APK
+          name: CleanYourTV-Working-Merged-APK
           path: out_apk/cleanyourtv-bt.apk
           
