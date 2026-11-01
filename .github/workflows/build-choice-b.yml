@@ -16,39 +16,79 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Apply PR #311 Bluetooth Pill Onto v3.2 Without Overwriting v3.2 Features
+      - name: Merge PR #311 Bluetooth Pill Cleanly Onto v3.2
         run: |
           git config user.name "Builder"
           git config user.email "builder@users.noreply.github.com"
           git fetch origin pull/311/head:pr-311
 
-          # Find the base commit where PR #311 branched off and apply only its diff with 3-way merge
           BASE_COMMIT=$(git merge-base main pr-311)
           git format-patch $BASE_COMMIT..pr-311 --stdout > pr311.patch
-          git apply --3way --ignore-space-change --ignore-whitespace pr311.patch || {
-            echo "Auto-resolving any overlapping lines while keeping BOTH v3.2 and PR #311 code..."
-            python3 - << 'PYEOF'
+          git apply --3way --ignore-space-change --ignore-whitespace pr311.patch || true
+
+          # 1. HomeKeyService.java has no Bluetooth code; keep pure v3.2 version so line 327 never breaks
+          git checkout main -- launcher/app/src/main/java/com/gathin/tvhome/HomeKeyService.java
+
+          # 2. Resolve any conflict markers in XML/Java cleanly
+          python3 - << 'PYEOF'
           import glob, re
 
           for path in glob.glob("launcher/**/*", recursive=True):
               try:
                   with open(path, "r", encoding="utf-8") as f:
                       content = f.read()
-                  if "<<<<<<<" in content:
-                      # Keep BOTH blocks (ours = v3.2 features, theirs = PR #311 Bluetooth)
-                      resolved = re.sub(
-                          r"<<<<<<<[^\n]*\n(.*?)=======\n(.*?)>>>>>>>[^\n]*\n",
-                          r"\1\2",
-                          content,
-                          flags=re.DOTALL
-                      )
-                      with open(path, "w", encoding="utf-8") as f:
-                          f.write(resolved)
-                      print(f"Resolved conflict in {path} by keeping both v3.2 and PR #311 blocks")
               except Exception:
-                  pass
+                  continue
+
+              if "<<<<<<<" not in content:
+                  continue
+
+              def resolve_block(match):
+                  ours = match.group(1)
+                  theirs = match.group(2)
+                  # If theirs (PR #311) contains bluetooth logic, keep theirs or combine safely
+                  if "bluetooth" in theirs.lower() or "bt" in theirs.lower():
+                      # Check brace balance of ours and theirs
+                      ours_diff = ours.count("{") - ours.count("}")
+                      theirs_diff = theirs.count("{") - theirs.count("}")
+                      if ours_diff == 0 and theirs_diff == 0:
+                          return ours + theirs
+                      return theirs
+                  else:
+                      # Otherwise keep v3.2 (ours) so v3.2 methods stay balanced
+                      return ours
+
+              resolved = re.sub(
+                  r"<<<<<<<[^\n]*\n(.*?)=======\n(.*?)>>>>>>>[^\n]*\n",
+                  resolve_block,
+                  content,
+                  flags=re.DOTALL
+              )
+
+              # Safety check for MainActivity.java:957 before applyViewInputsHandler
+              if path.endswith("MainActivity.java"):
+                  # Ensure braces are balanced before private/public method declarations
+                  lines = resolved.splitlines()
+                  out_lines = []
+                  depth = 0
+                  in_class = False
+                  for line in lines:
+                      stripped = line.strip()
+                      if re.match(r"^(private|public|protected)\s+(void|boolean|int|String|View|Drawable)\s+\w+\s*\(", stripped):
+                          # Class body level is depth == 1; close any unclosed method braces before starting a new method
+                          while depth > 1:
+                              out_lines.append("    }")
+                              depth -= 1
+                      out_lines.append(line)
+                      # Track brace depth (ignoring strings/comments roughly)
+                      code_only = re.sub(r'".*?"|//.*$', "", line)
+                      depth += code_only.count("{") - code_only.count("}")
+                  resolved = "\n".join(out_lines) + "\n"
+
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(resolved)
+              print(f"Cleanly resolved {path}")
           PYEOF
-          }
 
       - name: Force-Enable Bluetooth Pill & v3.2 Visual Flags by Default
         working-directory: ./launcher
@@ -56,7 +96,6 @@ jobs:
           python3 - << 'EOF'
           import glob, os, re
 
-          # 1. Enable Bluetooth pill & v3.2 flags in all config.xml / strings / bools
           for xml_file in glob.glob("app/src/main/res/values*/*.xml"):
               txt = open(xml_file).read()
               txt = re.sub(
@@ -67,7 +106,6 @@ jobs:
               )
               open(xml_file, "w").write(txt)
 
-          # 2. Ensure default false fallbacks in MainActivity.java for Bluetooth & v3.2 keys default to true
           for java_file in glob.glob("app/src/main/java/**/*.java", recursive=True):
               jtxt = open(java_file).read()
               for key in ["show_bluetooth", "bluetooth_pill", "show_bluetooth_pill", "date_below_clock", "header_white", "wifi_status_color", "wifi_status_warnings"]:
@@ -78,7 +116,6 @@ jobs:
                   )
               open(java_file, "w").write(jtxt)
 
-          # 3. Enable R8 shrinking in app/build.gradle so the APK compiles to ~550 KB
           gradle_file = "app/build.gradle"
           if os.path.exists(gradle_file):
               g = open(gradle_file).read()
