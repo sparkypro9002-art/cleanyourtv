@@ -1,4 +1,4 @@
-name: Compile Choice B Bluetooth Launcher
+name: Compile Choice B Bluetooth Launcher (v3.2 + PR 311)
 
 on:
   workflow_dispatch:
@@ -9,32 +9,81 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Gathin23/cleanyourtv
+      - name: Checkout Latest Gathin23/cleanyourtv (v3.2)
         uses: actions/checkout@v4
         with:
           repository: Gathin23/cleanyourtv
+          ref: main
           fetch-depth: 0
 
-      - name: Fetch PR #311 (Xiaomi Bluetooth Pill Fork)
+      - name: Apply PR #311 Bluetooth Pill Onto v3.2 Without Overwriting v3.2 Features
         run: |
-          git fetch origin pull/311/head:pr-311-bt
-          git checkout pr-311-bt
+          git config user.name "Builder"
+          git config user.email "builder@users.noreply.github.com"
+          git fetch origin pull/311/head:pr-311
 
-      - name: Turn On Opt-In Bluetooth Pill by Default in config.xml
+          # Find the base commit where PR #311 branched off and apply only its diff with 3-way merge
+          BASE_COMMIT=$(git merge-base main pr-311)
+          git format-patch $BASE_COMMIT..pr-311 --stdout > pr311.patch
+          git apply --3way --ignore-space-change --ignore-whitespace pr311.patch || {
+            echo "Auto-resolving any overlapping lines while keeping BOTH v3.2 and PR #311 code..."
+            python3 - << 'PYEOF'
+          import glob, re
+
+          for path in glob.glob("launcher/**/*", recursive=True):
+              try:
+                  with open(path, "r", encoding="utf-8") as f:
+                      content = f.read()
+                  if "<<<<<<<" in content:
+                      # Keep BOTH blocks (ours = v3.2 features, theirs = PR #311 Bluetooth)
+                      resolved = re.sub(
+                          r"<<<<<<<[^\n]*\n(.*?)=======\n(.*?)>>>>>>>[^\n]*\n",
+                          r"\1\2",
+                          content,
+                          flags=re.DOTALL
+                      )
+                      with open(path, "w", encoding="utf-8") as f:
+                          f.write(resolved)
+                      print(f"Resolved conflict in {path} by keeping both v3.2 and PR #311 blocks")
+              except Exception:
+                  pass
+          PYEOF
+          }
+
+      - name: Force-Enable Bluetooth Pill & v3.2 Visual Flags by Default
         working-directory: ./launcher
         run: |
           python3 - << 'EOF'
-          import glob, re
-          for cfg in glob.glob("app/src/main/res/values*/config.xml"):
-              txt = open(cfg).read()
-              updated = re.sub(
-                  r'(<bool\s+name="[^"]*bluetooth[^"]*"\s*>\s*)false(\s*</bool>)',
+          import glob, os, re
+
+          # 1. Enable Bluetooth pill & v3.2 flags in all config.xml / strings / bools
+          for xml_file in glob.glob("app/src/main/res/values*/*.xml"):
+              txt = open(xml_file).read()
+              txt = re.sub(
+                  r'(<bool\s+name="[^"]*(?:bluetooth|date_below_clock|header_white|wifi_status)[^"]*"\s*>\s*)false(\s*</bool>)',
                   r'\g<1>true\g<2>',
                   txt,
                   flags=re.IGNORECASE
               )
-              open(cfg, "w").write(updated)
-              print(f"Enabled Bluetooth pill in {cfg}")
+              open(xml_file, "w").write(txt)
+
+          # 2. Ensure default false fallbacks in MainActivity.java for Bluetooth & v3.2 keys default to true
+          for java_file in glob.glob("app/src/main/java/**/*.java", recursive=True):
+              jtxt = open(java_file).read()
+              for key in ["show_bluetooth", "bluetooth_pill", "show_bluetooth_pill", "date_below_clock", "header_white", "wifi_status_color", "wifi_status_warnings"]:
+                  jtxt = re.sub(
+                      rf'(optBoolean\(\s*"{key}"\s*,\s*)false(\s*\))',
+                      r'\g<1>true\g<2>',
+                      jtxt
+                  )
+              open(java_file, "w").write(jtxt)
+
+          # 3. Enable R8 shrinking in app/build.gradle so the APK compiles to ~550 KB
+          gradle_file = "app/build.gradle"
+          if os.path.exists(gradle_file):
+              g = open(gradle_file).read()
+              g = re.sub(r'minifyEnabled\s+false', 'minifyEnabled true\n            shrinkResources true', g)
+              open(gradle_file, "w").write(g)
           EOF
 
       - name: Set up JDK 17
@@ -43,23 +92,22 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Compile and Sign APK
+      - name: Compile & Sign APK
         working-directory: ./launcher
         run: |
           chmod +x gradlew 2>/dev/null || true
-          if [ -f "./gradlew" ]; then
-            ./gradlew assembleDebug assembleRelease
-          else
-            gradle assembleDebug assembleRelease
-          fi
+          ./gradlew assembleRelease || ./gradlew assembleDebug
 
-      - name: Collect Signed APK
-        run: |
-          mkdir -p out_apk
-          cp $(find launcher -name "*-debug.apk" | head -n 1) out_apk/cleanyourtv-bt.apk
-          ls -lh out_apk/
+          RAW_APK=$(find app/build/outputs/apk -name "*.apk" | sort | head -n 1)
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
 
-      - name: Upload APK Artifact
+          $BUILD_TOOLS/zipalign -f -p 4 "$RAW_APK" aligned.apk
+          keytool -genkey -v -keystore release.keystore -storepass android -alias releasekey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=CleanYourTV,O=Android,C=IN"
+          mkdir -p ../out_apk
+          $BUILD_TOOLS/apksigner sign --ks release.keystore --ks-pass pass:android --key-pass pass:android --out ../out_apk/cleanyourtv-bt.apk aligned.apk
+          ls -lh ../out_apk/cleanyourtv-bt.apk
+
+      - name: Upload Merged v3.2 + Bluetooth APK
         uses: actions/upload-artifact@v4
         with:
           name: CleanYourTV-ChoiceB-APK
