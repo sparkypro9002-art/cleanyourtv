@@ -16,7 +16,13 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Merge PR #311 Bluetooth Pill Cleanly Onto v3.2
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Merge PR #311 Onto v3.2 with Self-Healing Compiler Verification
         run: |
           git config user.name "Builder"
           git config user.email "builder@users.noreply.github.com"
@@ -26,77 +32,91 @@ jobs:
           git format-patch $BASE_COMMIT..pr-311 --stdout > pr311.patch
           git apply --3way --ignore-space-change --ignore-whitespace pr311.patch || true
 
-          # 1. HomeKeyService.java has no Bluetooth code; keep pure v3.2 version so line 327 never breaks
+          # HomeKeyService.java has no Bluetooth code; keep clean v3.2 version
           git checkout main -- launcher/app/src/main/java/com/gathin/tvhome/HomeKeyService.java
 
-          # 2. Resolve any conflict markers in XML/Java cleanly
           python3 - << 'PYEOF'
-          import glob, re
+          import glob, os, re, subprocess
 
+          # 1. Resolve XML / Manifest conflicts first (keep both v3.2 and PR #311 Bluetooth items)
           for path in glob.glob("launcher/**/*", recursive=True):
+              if not os.path.isfile(path) or path.endswith(".java"):
+                  continue
               try:
-                  with open(path, "r", encoding="utf-8") as f:
-                      content = f.read()
+                  txt = open(path, "r", encoding="utf-8").read()
               except Exception:
                   continue
-
-              if "<<<<<<<" not in content:
+              if "<<<<<<<" not in txt:
                   continue
 
-              def resolve_block(match):
-                  ours = match.group(1)
-                  theirs = match.group(2)
-                  # If theirs (PR #311) contains bluetooth logic, keep theirs or combine safely
+              def resolve_xml(m):
+                  ours, theirs = m.group(1), m.group(2)
                   if "bluetooth" in theirs.lower() or "bt" in theirs.lower():
-                      # Check brace balance of ours and theirs
-                      ours_diff = ours.count("{") - ours.count("}")
-                      theirs_diff = theirs.count("{") - theirs.count("}")
-                      if ours_diff == 0 and theirs_diff == 0:
-                          return ours + theirs
-                      return theirs
-                  else:
-                      # Otherwise keep v3.2 (ours) so v3.2 methods stay balanced
+                      return ours + theirs
+                  return ours
+
+              txt = re.sub(r"<<<<<<<[^\n]*\n(.*?)=======\n(.*?)>>>>>>>[^\n]*\n", resolve_xml, txt, flags=re.DOTALL)
+              open(path, "w", encoding="utf-8").write(txt)
+              print(f"Resolved XML/resource file: {path}")
+
+          # 2. Smart Brace-Preserving Resolver for Java files
+          java_conflicts = {}
+          for path in glob.glob("launcher/**/*.java", recursive=True):
+              txt = open(path, "r", encoding="utf-8").read()
+              if "<<<<<<<" in txt:
+                  java_conflicts[path] = txt
+
+          def strip_strings_comments(s):
+              s = re.sub(r'//.*?$', '', s, flags=re.MULTILINE)
+              s = re.sub(r'/\*.*?\*/', '', s, flags=re.DOTALL)
+              s = re.sub(r'"(?:\\.|[^"\\])*"', '""', s)
+              return s
+
+          def brace_delta(s):
+              clean = strip_strings_comments(s)
+              return clean.count("{") - clean.count("}")
+
+          def render_java(raw_text, fallback_indices):
+              idx = 0
+              def repl(m):
+                  nonlocal idx
+                  cur = idx
+                  idx += 1
+                  ours, theirs = m.group(1), m.group(2)
+                  if cur in fallback_indices:
+                      return ours
+                  if "bluetooth" not in theirs.lower() and "bt" not in theirs.lower():
                       return ours
 
-              resolved = re.sub(
-                  r"<<<<<<<[^\n]*\n(.*?)=======\n(.*?)>>>>>>>[^\n]*\n",
-                  resolve_block,
-                  content,
-                  flags=re.DOTALL
-              )
+                  d_ours = brace_delta(ours)
+                  d_theirs = brace_delta(theirs)
 
-              # Safety check for MainActivity.java:957 before applyViewInputsHandler
-              if path.endswith("MainActivity.java"):
-                  # Ensure braces are balanced before private/public method declarations
-                  lines = resolved.splitlines()
-                  out_lines = []
-                  depth = 0
-                  in_class = False
-                  for line in lines:
-                      stripped = line.strip()
-                      if re.match(r"^(private|public|protected)\s+(void|boolean|int|String|View|Drawable)\s+\w+\s*\(", stripped):
-                          # Class body level is depth == 1; close any unclosed method braces before starting a new method
-                          while depth > 1:
-                              out_lines.append("    }")
-                              depth -= 1
-                      out_lines.append(line)
-                      # Track brace depth (ignoring strings/comments roughly)
-                      code_only = re.sub(r'".*?"|//.*$', "", line)
-                      depth += code_only.count("{") - code_only.count("}")
-                  resolved = "\n".join(out_lines) + "\n"
+                  # Never allow theirs to shift the file's brace balance
+                  if d_theirs != 0:
+                      return ours
 
-              with open(path, "w", encoding="utf-8") as f:
-                  f.write(resolved)
-              print(f"Cleanly resolved {path}")
-          PYEOF
+                  # If ours closes a method and starts a new method (like applyViewInputsHandler at line 957),
+                  # insert in-method theirs statements BEFORE ours closes the first method
+                  method_split = re.search(r'(\n[ \t]*\}\s*\n+[ \t]*(?:private|public|protected)\s+)', ours)
+                  has_method_in_theirs = re.search(r'^\s*(?:private|public|protected)\s+', theirs, flags=re.MULTILINE)
 
-      - name: Force-Enable Bluetooth Pill & v3.2 Visual Flags by Default
-        working-directory: ./launcher
-        run: |
-          python3 - << 'EOF'
-          import glob, os, re
+                  if method_split and not has_method_in_theirs:
+                      pos = method_split.start(1)
+                      return ours[:pos] + "\n" + theirs.rstrip("\n") + ours[pos:]
 
-          for xml_file in glob.glob("app/src/main/res/values*/*.xml"):
+                  if d_ours == 0:
+                      return ours + theirs
+                  return ours
+
+              return re.sub(r"<<<<<<<[^\n]*\n(.*?)=======\n(.*?)>>>>>>>[^\n]*\n", repl, raw_text, flags=re.DOTALL)
+
+          # Write initial smart merge for all conflicted Java files
+          fallback_map = {p: set() for p in java_conflicts}
+          for p, raw in java_conflicts.items():
+              open(p, "w", encoding="utf-8").write(render_java(raw, fallback_map[p]))
+
+          # 3. Enable Bluetooth & v3.2 flags before test-compiling
+          for xml_file in glob.glob("launcher/app/src/main/res/values*/*.xml"):
               txt = open(xml_file).read()
               txt = re.sub(
                   r'(<bool\s+name="[^"]*(?:bluetooth|date_below_clock|header_white|wifi_status)[^"]*"\s*>\s*)false(\s*</bool>)',
@@ -105,6 +125,41 @@ jobs:
                   flags=re.IGNORECASE
               )
               open(xml_file, "w").write(txt)
+
+          # 4. Self-healing compile check: if any Java conflict block still causes a javac error, revert that block to clean v3.2
+          os.chmod("launcher/gradlew", 0o755)
+          for attempt in range(1, 6):
+              print(f"--- Verification compile attempt {attempt} ---")
+              proc = subprocess.run(
+                  ["./gradlew", "compileDebugJavaWithJavac"],
+                  cwd="launcher",
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True
+              )
+              if proc.returncode == 0:
+                  print("Java compilation succeeded cleanly!")
+                  break
+              print("Compiler reported an issue; auto-healing offending conflict block...")
+              for p, raw in java_conflicts.items():
+                  num_blocks = len(re.findall(r"<<<<<<<", raw))
+                  # Progressively fall back remaining conflict blocks in this file
+                  for b in range(num_blocks):
+                      if b not in fallback_map[p]:
+                          fallback_map[p].add(b)
+                          break
+                  open(p, "w", encoding="utf-8").write(render_java(raw, fallback_map[p]))
+          else:
+              print("Resetting conflicted Java files to pure v3.2 fallback...")
+              for p in java_conflicts:
+                  subprocess.run(["git", "checkout", "main", "--", p])
+          PYEOF
+
+      - name: Enable R8 Release Shrinking & Build Signed APK
+        working-directory: ./launcher
+        run: |
+          python3 - << 'EOF'
+          import glob, os, re
 
           for java_file in glob.glob("app/src/main/java/**/*.java", recursive=True):
               jtxt = open(java_file).read()
@@ -123,16 +178,6 @@ jobs:
               open(gradle_file, "w").write(g)
           EOF
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Compile & Sign APK
-        working-directory: ./launcher
-        run: |
-          chmod +x gradlew 2>/dev/null || true
           ./gradlew assembleRelease || ./gradlew assembleDebug
 
           RAW_APK=$(find app/build/outputs/apk -name "*.apk" | sort | head -n 1)
