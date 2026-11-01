@@ -1,4 +1,4 @@
-name: Compile Choice B Bluetooth Launcher (v3.2 + PR 311)
+name: Compile Windows 10 Edition CleanYourTV (v3.2 + PR 311)
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Merge PR #311 Onto v3.2 with Self-Healing Compiler Verification
+      - name: Merge PR #311 Bluetooth Pill with Self-Healing Verification
         run: |
           git config user.name "Builder"
           git config user.email "builder@users.noreply.github.com"
@@ -32,13 +32,11 @@ jobs:
           git format-patch $BASE_COMMIT..pr-311 --stdout > pr311.patch
           git apply --3way --ignore-space-change --ignore-whitespace pr311.patch || true
 
-          # HomeKeyService.java has no Bluetooth code; keep clean v3.2 version
           git checkout main -- launcher/app/src/main/java/com/gathin/tvhome/HomeKeyService.java
 
           python3 - << 'PYEOF'
           import glob, os, re, subprocess
 
-          # 1. Resolve XML / Manifest conflicts first (keep both v3.2 and PR #311 Bluetooth items)
           for path in glob.glob("launcher/**/*", recursive=True):
               if not os.path.isfile(path) or path.endswith(".java"):
                   continue
@@ -48,33 +46,29 @@ jobs:
                   continue
               if "<<<<<<<" not in txt:
                   continue
-
               def resolve_xml(m):
                   ours, theirs = m.group(1), m.group(2)
                   if "bluetooth" in theirs.lower() or "bt" in theirs.lower():
                       return ours + theirs
                   return ours
-
               txt = re.sub(r"<<<<<<<[^\n]*\n(.*?)=======\n(.*?)>>>>>>>[^\n]*\n", resolve_xml, txt, flags=re.DOTALL)
               open(path, "w", encoding="utf-8").write(txt)
-              print(f"Resolved XML/resource file: {path}")
 
-          # 2. Smart Brace-Preserving Resolver for Java files
           java_conflicts = {}
           for path in glob.glob("launcher/**/*.java", recursive=True):
               txt = open(path, "r", encoding="utf-8").read()
               if "<<<<<<<" in txt:
                   java_conflicts[path] = txt
 
-          def strip_strings_comments(s):
+          def strip_sc(s):
               s = re.sub(r'//.*?$', '', s, flags=re.MULTILINE)
               s = re.sub(r'/\*.*?\*/', '', s, flags=re.DOTALL)
               s = re.sub(r'"(?:\\.|[^"\\])*"', '""', s)
               return s
 
-          def brace_delta(s):
-              clean = strip_strings_comments(s)
-              return clean.count("{") - clean.count("}")
+          def b_delta(s):
+              c = strip_sc(s)
+              return c.count("{") - c.count("}")
 
           def render_java(raw_text, fallback_indices):
               idx = 0
@@ -87,90 +81,82 @@ jobs:
                       return ours
                   if "bluetooth" not in theirs.lower() and "bt" not in theirs.lower():
                       return ours
-
-                  d_ours = brace_delta(ours)
-                  d_theirs = brace_delta(theirs)
-
-                  # Never allow theirs to shift the file's brace balance
-                  if d_theirs != 0:
+                  if b_delta(theirs) != 0:
                       return ours
-
-                  # If ours closes a method and starts a new method (like applyViewInputsHandler at line 957),
-                  # insert in-method theirs statements BEFORE ours closes the first method
                   method_split = re.search(r'(\n[ \t]*\}\s*\n+[ \t]*(?:private|public|protected)\s+)', ours)
                   has_method_in_theirs = re.search(r'^\s*(?:private|public|protected)\s+', theirs, flags=re.MULTILINE)
-
                   if method_split and not has_method_in_theirs:
                       pos = method_split.start(1)
                       return ours[:pos] + "\n" + theirs.rstrip("\n") + ours[pos:]
-
-                  if d_ours == 0:
+                  if b_delta(ours) == 0:
                       return ours + theirs
                   return ours
-
               return re.sub(r"<<<<<<<[^\n]*\n(.*?)=======\n(.*?)>>>>>>>[^\n]*\n", repl, raw_text, flags=re.DOTALL)
 
-          # Write initial smart merge for all conflicted Java files
           fallback_map = {p: set() for p in java_conflicts}
           for p, raw in java_conflicts.items():
               open(p, "w", encoding="utf-8").write(render_java(raw, fallback_map[p]))
 
-          # 3. Enable Bluetooth & v3.2 flags before test-compiling
-          for xml_file in glob.glob("launcher/app/src/main/res/values*/*.xml"):
-              txt = open(xml_file).read()
-              txt = re.sub(
-                  r'(<bool\s+name="[^"]*(?:bluetooth|date_below_clock|header_white|wifi_status)[^"]*"\s*>\s*)false(\s*</bool>)',
-                  r'\g<1>true\g<2>',
-                  txt,
-                  flags=re.IGNORECASE
-              )
-              open(xml_file, "w").write(txt)
-
-          # 4. Self-healing compile check: if any Java conflict block still causes a javac error, revert that block to clean v3.2
           os.chmod("launcher/gradlew", 0o755)
           for attempt in range(1, 6):
-              print(f"--- Verification compile attempt {attempt} ---")
-              proc = subprocess.run(
-                  ["./gradlew", "compileDebugJavaWithJavac"],
-                  cwd="launcher",
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT,
-                  text=True
-              )
+              proc = subprocess.run(["./gradlew", "compileDebugJavaWithJavac"], cwd="launcher", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
               if proc.returncode == 0:
-                  print("Java compilation succeeded cleanly!")
                   break
-              print("Compiler reported an issue; auto-healing offending conflict block...")
               for p, raw in java_conflicts.items():
                   num_blocks = len(re.findall(r"<<<<<<<", raw))
-                  # Progressively fall back remaining conflict blocks in this file
                   for b in range(num_blocks):
                       if b not in fallback_map[p]:
                           fallback_map[p].add(b)
                           break
                   open(p, "w", encoding="utf-8").write(render_java(raw, fallback_map[p]))
           else:
-              print("Resetting conflicted Java files to pure v3.2 fallback...")
               for p in java_conflicts:
                   subprocess.run(["git", "checkout", "main", "--", p])
           PYEOF
 
-      - name: Enable R8 Release Shrinking & Build Signed APK
+      - name: Apply Windows 10 Bottom Taskbar, System Tray & 6x2 Desktop Grid
         working-directory: ./launcher
         run: |
           python3 - << 'EOF'
           import glob, os, re
 
+          # 1. Bake your 24-question Windows 10 defaults into Java config readers
           for java_file in glob.glob("app/src/main/java/**/*.java", recursive=True):
               jtxt = open(java_file).read()
-              for key in ["show_bluetooth", "bluetooth_pill", "show_bluetooth_pill", "date_below_clock", "header_white", "wifi_status_color", "wifi_status_warnings"]:
-                  jtxt = re.sub(
-                      rf'(optBoolean\(\s*"{key}"\s*,\s*)false(\s*\))',
-                      r'\g<1>true\g<2>',
-                      jtxt
-                  )
+              true_keys = [
+                  "show_bluetooth", "bluetooth_pill", "show_bluetooth_pill",
+                  "date_below_clock", "header_white", "wifi_status_color",
+                  "wifi_status_warnings", "dock_glass", "always_show_names",
+                  "icon_only_buttons", "icon_only_inputs", "reduced_motion", "wallpaper"
+              ]
+              false_keys = [
+                  "dock_title", "fill_dock", "dock_even_padding", "top_menu",
+                  "ambient_glow", "app_glow", "cinematic_home", "advanced_effects",
+                  "module_cards", "focus_overshoot"
+              ]
+              for k in true_keys:
+                  jtxt = re.sub(rf'(optBoolean\(\s*"{k}"\s*,\s*)false(\s*\))', r'\g<1>true\g<2>', jtxt)
+              for k in false_keys:
+                  jtxt = re.sub(rf'(optBoolean\(\s*"{k}"\s*,\s*)true(\s*\))', r'\g<1>false\g<2>', jtxt)
+
+              # Default columns to 6 and rows_below_dock to 2
+              jtxt = re.sub(r'(optInt\(\s*"columns"\s*,\s*)\d+(\s*\))', r'\g<1>6\g<2>', jtxt)
+              jtxt = re.sub(r'(optInt\(\s*"rows_below_dock"\s*,\s*)\d+(\s*\))', r'\g<1>2\g<2>', jtxt)
+              jtxt = re.sub(r'(optInt\(\s*"dock_opacity"\s*,\s*)\d+(\s*\))', r'\g<1>85\g<2>', jtxt)
               open(java_file, "w").write(jtxt)
 
+          # 2. Patch activity_main.xml: Move System Tray & Taskbar to bottom edge (1A, 9A, 11A)
+          for layout_file in glob.glob("app/src/main/res/layout*/activity_main.xml"):
+              xml = open(layout_file).read()
+              # Anchor top header/system tray to bottom edge for Windows 10 System Tray
+              xml = re.sub(r'android:layout_gravity="top"', 'android:layout_gravity="bottom"', xml)
+              xml = re.sub(r'android:layout_gravity="top\|end"', 'android:layout_gravity="bottom|end"', xml)
+              xml = re.sub(r'android:layout_gravity="top\|right"', 'android:layout_gravity="bottom|right"', xml)
+              xml = re.sub(r'android:layout_alignParentTop="true"', 'android:layout_alignParentBottom="true"', xml)
+              open(layout_file, "w").write(xml)
+              print(f"Patched Windows 10 bottom taskbar & system tray in {layout_file}")
+
+          # 3. Enable R8 shrinking for ~550 KB APK size
           gradle_file = "app/build.gradle"
           if os.path.exists(gradle_file):
               g = open(gradle_file).read()
@@ -189,9 +175,9 @@ jobs:
           $BUILD_TOOLS/apksigner sign --ks release.keystore --ks-pass pass:android --key-pass pass:android --out ../out_apk/cleanyourtv-bt.apk aligned.apk
           ls -lh ../out_apk/cleanyourtv-bt.apk
 
-      - name: Upload Merged v3.2 + Bluetooth APK
+      - name: Upload Windows 10 Edition APK
         uses: actions/upload-artifact@v4
         with:
-          name: CleanYourTV-ChoiceB-APK
+          name: CleanYourTV-Win10-APK
           path: out_apk/cleanyourtv-bt.apk
           
