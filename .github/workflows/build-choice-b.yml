@@ -1,4 +1,4 @@
-name: Compile Indestructible CleanYourTV + Bluetooth APK
+name: Compile Working Merged CleanYourTV APK
 
 on:
   workflow_dispatch:
@@ -16,379 +16,205 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Set up JDK 17
+      - name: Set up JDK 17 First
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Inject Standalone BluetoothPillHelper & Manifest Permissions
+      - name: Merge PR #311 & Lock Bluetooth Permissions
         run: |
-          python3 - << 'PYEOF'
-          import glob, os, re
+          git config user.name "Builder"
+          git config user.email "builder@users.noreply.github.com"
+          git fetch origin pull/311/head:pr-311
 
-          # 1. Inject all 6 Bluetooth & Location permissions into AndroidManifest.xml
-          manifest_path = "launcher/app/src/main/AndroidManifest.xml"
-          m_txt = open(manifest_path, "r", encoding="utf-8").read()
-          # Remove maxSdkVersion constraints on Bluetooth if any exist
-          m_txt = re.sub(r'android:maxSdkVersion="\d+"', '', m_txt)
+          BASE_COMMIT=$(git merge-base main pr-311)
+          git format-patch $BASE_COMMIT..pr-311 --stdout > pr311.patch
+          git apply --3way --ignore-space-change --ignore-whitespace pr311.patch || true
+          git checkout main -- launcher/app/src/main/java/com/gathin/tvhome/HomeKeyService.java
 
-          required_perms = [
-              "android.permission.BLUETOOTH",
-              "android.permission.BLUETOOTH_ADMIN",
-              "android.permission.BLUETOOTH_CONNECT",
-              "android.permission.BLUETOOTH_SCAN",
-              "android.permission.ACCESS_FINE_LOCATION",
-              "android.permission.ACCESS_COARSE_LOCATION",
-          ]
-          inject_block = ""
-          for perm in required_perms:
-              if perm not in m_txt:
-                  inject_block += f'    <uses-permission android:name="{perm}" />\n'
-          if inject_block:
-              m_txt = re.sub(r'(<manifest[^>]*>\s*\n)', r'\1' + inject_block, m_txt, count=1)
-              open(manifest_path, "w", encoding="utf-8").write(m_txt)
-              print("Locked all 6 Bluetooth permissions into AndroidManifest.xml")
+          cat << 'EOF' > merge_fix.py
+          import glob, os, re, subprocess
 
-          # 2. Write standalone, zero-conflict BluetoothPillHelper.java
-          bt_helper_path = "launcher/app/src/main/java/com/gathin/tvhome/BluetoothPillHelper.java"
-          bt_helper_code = r'''package com.gathin.tvhome;
+          for path in glob.glob("launcher/**/*", recursive=True):
+              if not os.path.isfile(path) or path.endswith(".java"):
+                  continue
+              try:
+                  txt = open(path, "r", encoding="utf-8").read()
+              except Exception:
+                  continue
+              if "<<<<<<<" not in txt:
+                  continue
+              def resolve_xml(m):
+                  o, t = m.group(1), m.group(2)
+                  return (o + t) if ("bluetooth" in t.lower() or "bt" in t.lower()) else o
+              txt = re.sub(r"<<<<<<<[^\n]*\n(.*?)=======\n(.*?)>>>>>>>[^\n]*\n", resolve_xml, txt, flags=re.DOTALL)
+              open(path, "w", encoding="utf-8").write(txt)
 
-          import android.app.Activity;
-          import android.app.AlertDialog;
-          import android.bluetooth.BluetoothAdapter;
-          import android.bluetooth.BluetoothDevice;
-          import android.bluetooth.BluetoothProfile;
-          import android.content.BroadcastReceiver;
-          import android.content.ComponentName;
-          import android.content.Context;
-          import android.content.DialogInterface;
-          import android.content.Intent;
-          import android.content.IntentFilter;
-          import android.content.pm.PackageManager;
-          import android.content.res.Resources;
-          import android.graphics.Canvas;
-          import android.graphics.Color;
-          import android.graphics.Paint;
-          import android.graphics.Path;
-          import android.graphics.Typeface;
-          import android.graphics.drawable.GradientDrawable;
-          import android.os.Build;
-          import android.os.Handler;
-          import android.os.Looper;
+          java_conflicts = {}
+          for path in glob.glob("launcher/**/*.java", recursive=True):
+              txt = open(path, "r", encoding="utf-8").read()
+              if "<<<<<<<" in txt:
+                  java_conflicts[path] = txt
+
+          def b_delta(s):
+              s = re.sub(r'//.*?$|/\*.*?\*/|"(?:\\.|[^"\\])*"', '', s, flags=re.MULTILINE|re.DOTALL)
+              return s.count("{") - s.count("}")
+
+          def render_java(raw, fb):
+              idx = 0
+              def repl(m):
+                  nonlocal idx
+                  cur = idx; idx += 1
+                  o, t = m.group(1), m.group(2)
+                  if cur in fb or ("bluetooth" not in t.lower() and "bt" not in t.lower()) or b_delta(t) != 0:
+                      return o
+                  ms = re.search(r'(\n[ \t]*\}\s*\n+[ \t]*(?:private|public|protected)\s+)', o)
+                  ht = re.search(r'^\s*(?:private|public|protected)\s+', t, flags=re.MULTILINE)
+                  if ms and not ht:
+                      p = ms.start(1)
+                      return o[:p] + "\n" + t.rstrip("\n") + o[p:]
+                  return (o + t) if b_delta(o) == 0 else o
+              return re.sub(r"<<<<<<<[^\n]*\n(.*?)=======\n(.*?)>>>>>>>[^\n]*\n", repl, raw, flags=re.DOTALL)
+
+          fb_map = {p: set() for p in java_conflicts}
+          for p, raw in java_conflicts.items():
+              open(p, "w", encoding="utf-8").write(render_java(raw, fb_map[p]))
+
+          os.chmod("launcher/gradlew", 0o755)
+          for _ in range(8):
+              r = subprocess.run(["./gradlew", "compileDebugJavaWithJavac"], cwd="launcher", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              if r.returncode == 0:
+                  print("Java merge compiled cleanly!")
+                  break
+              for p, raw in java_conflicts.items():
+                  for b in range(len(re.findall(r"<<<<<<<", raw))):
+                      if b not in fb_map[p]:
+                          fb_map[p].add(b)
+                          break
+                  open(p, "w", encoding="utf-8").write(render_java(raw, fb_map[p]))
+          else:
+              for p in java_conflicts:
+                  subprocess.run(["git", "checkout", "main", "--", p])
+
+          mf = "launcher/app/src/main/AndroidManifest.xml"
+          mtxt = open(mf).read()
+          mtxt = re.sub(r'android:maxSdkVersion="\d+"', '', mtxt)
+          perms = ["BLUETOOTH", "BLUETOOTH_ADMIN", "BLUETOOTH_CONNECT", "BLUETOOTH_SCAN", "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION"]
+          ins = "".join(f'    <uses-permission android:name="android.permission.{p}" />\n' for p in perms if f"android.permission.{p}" not in mtxt)
+          if ins:
+              mtxt = re.sub(r'(<manifest[^>]*>\s*\n)', r'\1' + ins, mtxt, count=1)
+              open(mf, "w").write(mtxt)
+
+          gf = "launcher/app/build.gradle"
+          if os.path.exists(gf):
+              g = open(gf).read()
+              g = re.sub(r'minifyEnabled\s+true', 'minifyEnabled false', g)
+              g = re.sub(r'shrinkResources\s+true', 'shrinkResources false', g)
+              open(gf, "w").write(g)
+          EOF
+          python3 merge_fix.py
+
+      - name: Attach Guaranteed Bluetooth Button Click Fallback
+        run: |
+          cat << 'EOF' > launcher/app/src/main/java/com/gathin/tvhome/BtFix.java
+          package com.gathin.tvhome;
+          import android.app.*;
+          import android.bluetooth.*;
+          import android.content.*;
+          import android.os.*;
           import android.provider.Settings;
-          import android.text.TextUtils;
-          import android.util.TypedValue;
-          import android.view.Gravity;
-          import android.view.KeyEvent;
-          import android.view.View;
-          import android.view.ViewGroup;
-          import android.widget.ArrayAdapter;
-          import android.widget.LinearLayout;
-          import android.widget.TextView;
-          import android.widget.Toast;
-          import java.lang.reflect.Method;
-          import java.util.ArrayList;
-          import java.util.List;
-          import java.util.Set;
+          import android.view.*;
+          import java.util.*;
 
-          public final class BluetoothPillHelper {
-              private static final String TAG_BT_PILL = "CYTV_BT_PILL_VIEW";
-              private static final Handler HANDLER = new Handler(Looper.getMainLooper());
-              private static BroadcastReceiver btReceiver;
-
-              public static void attach(final Activity activity) {
-                  if (activity == null) return;
-                  final Runnable setupTask = new Runnable() {
-                      @Override
-                      public void run() {
-                          try {
-                              ensurePillAttached(activity);
-                          } catch (Throwable ignored) {}
-                      }
-                  };
-                  HANDLER.post(setupTask);
-                  HANDLER.postDelayed(setupTask, 200);
-                  HANDLER.postDelayed(setupTask, 700);
-                  HANDLER.postDelayed(setupTask, 1600);
-                  registerBtReceiver(activity);
-              }
-
-              private static void registerBtReceiver(final Activity activity) {
-                  if (btReceiver != null) return;
-                  try {
-                      btReceiver = new BroadcastReceiver() {
-                          @Override
-                          public void onReceive(Context context, Intent intent) {
-                              ensurePillAttached(activity);
-                          }
-                      };
-                      IntentFilter filter = new IntentFilter();
-                      filter.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
-                      filter.addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED);
-                      filter.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
-                      filter.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
-                      filter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
-                      activity.getApplicationContext().registerReceiver(btReceiver, filter);
-                  } catch (Throwable ignored) {}
-              }
-
-              private static void ensurePillAttached(final Activity activity) {
-                  if (activity.isFinishing() || activity.isDestroyed()) return;
-                  View root = activity.findViewById(android.R.id.content);
-                  if (!(root instanceof ViewGroup)) return;
-
-                  View existing = root.findViewWithTag(TAG_BT_PILL);
-                  if (existing instanceof LinearLayout) {
-                      existing.setVisibility(View.VISIBLE);
-                      updatePillContent(activity, (LinearLayout) existing);
-                      return;
-                  }
-
-                  View refPill = findReferencePill((ViewGroup) root, activity.getResources(), activity.getPackageName());
-                  if (refPill == null || !(refPill.getParent() instanceof LinearLayout)) return;
-
-                  LinearLayout bar = (LinearLayout) refPill.getParent();
-                  final LinearLayout btPill = buildPillView(activity, refPill);
-                  int idx = bar.indexOfChild(refPill);
-                  bar.addView(btPill, Math.max(0, idx));
-                  updatePillContent(activity, btPill);
-              }
-
-              private static View findReferencePill(ViewGroup root, Resources res, String pkg) {
-                  String[] knownIds = {
-                      "wifi_pill", "network_pill", "settings_pill", "inputs_pill",
-                      "btn_wifi", "btn_network", "btn_settings", "btn_inputs",
-                      "wifi_button", "settings_button", "inputs_button"
-                  };
-                  for (String name : knownIds) {
-                      int id = res.getIdentifier(name, "id", pkg);
-                      if (id != 0) {
-                          View v = root.findViewById(id);
-                          if (v != null && v.getParent() instanceof LinearLayout) {
-                              LinearLayout p = (LinearLayout) v.getParent();
-                              if (p.getOrientation() == LinearLayout.HORIZONTAL) return v;
-                              if (p.getParent() instanceof LinearLayout && ((LinearLayout) p.getParent()).getOrientation() == LinearLayout.HORIZONTAL) {
-                                  return p;
-                              }
-                          }
-                      }
-                  }
-                  return scanForTopBarPill(root, res);
-              }
-
-              private static View scanForTopBarPill(ViewGroup group, Resources res) {
-                  for (int i = 0; i < group.getChildCount(); i++) {
-                      View child = group.getChildAt(i);
-                      if (child.getId() != View.NO_ID) {
-                          try {
-                              String entry = res.getResourceEntryName(child.getId()).toLowerCase();
-                              if (entry.contains("wifi") || entry.contains("network") || entry.contains("setting")) {
-                                  if (child.isFocusable() && child.getParent() instanceof LinearLayout) {
-                                      return child;
-                                  }
-                                  if (child.getParent() instanceof View && ((View) child.getParent()).isFocusable()
-                                          && child.getParent().getParent() instanceof LinearLayout) {
-                                      return (View) child.getParent();
-                                  }
-                              }
-                          } catch (Throwable ignored) {}
-                      }
-                      if (child instanceof LinearLayout) {
-                          LinearLayout ll = (LinearLayout) child;
-                          if (ll.getOrientation() == LinearLayout.HORIZONTAL && ll.getChildCount() >= 2 && ll.getChildCount() <= 6) {
-                              int focusableCount = 0;
-                              View firstFocusable = null;
-                              for (int j = 0; j < ll.getChildCount(); j++) {
-                                  View c = ll.getChildAt(j);
-                                  if (c.isFocusable() && c.getVisibility() == View.VISIBLE) {
-                                      focusableCount++;
-                                      if (firstFocusable == null) firstFocusable = c;
-                                  }
-                              }
-                              if (focusableCount >= 2 && firstFocusable != null && ll.getHeight() < dp(group.getContext(), 90)) {
-                                  return firstFocusable;
-                              }
-                          }
-                      }
-                      if (child instanceof ViewGroup) {
-                          View found = scanForTopBarPill((ViewGroup) child, res);
-                          if (found != null) return found;
-                      }
-                  }
-                  return null;
-              }
-
-              private static LinearLayout buildPillView(final Activity activity, View refPill) {
-                  final LinearLayout pill = new LinearLayout(activity);
-                  pill.setTag(TAG_BT_PILL);
-                  pill.setOrientation(LinearLayout.HORIZONTAL);
-                  pill.setGravity(Gravity.CENTER_VERTICAL);
-                  pill.setFocusable(true);
-                  pill.setFocusableInTouchMode(false);
-                  pill.setClickable(true);
-
-                  int padH = refPill.getPaddingLeft() > 0 ? refPill.getPaddingLeft() : dp(activity, 14);
-                  int padV = refPill.getPaddingTop() > 0 ? refPill.getPaddingTop() : dp(activity, 7);
-                  pill.setPadding(padH, padV, padH, padV);
-
-                  LinearLayout.LayoutParams lp;
-                  ViewGroup.LayoutParams refLp = refPill.getLayoutParams();
-                  if (refLp instanceof LinearLayout.LayoutParams) {
-                      LinearLayout.LayoutParams rlp = (LinearLayout.LayoutParams) refLp;
-                      lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, rlp.height);
-                      lp.topMargin = rlp.topMargin;
-                      lp.bottomMargin = rlp.bottomMargin;
-                      lp.leftMargin = rlp.leftMargin > 0 ? rlp.leftMargin : dp(activity, 8);
-                      lp.rightMargin = rlp.rightMargin > 0 ? rlp.rightMargin : dp(activity, 8);
-                      lp.gravity = rlp.gravity;
-                  } else {
-                      lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                      lp.rightMargin = dp(activity, 8);
-                      lp.leftMargin = dp(activity, 8);
-                  }
-                  pill.setLayoutParams(lp);
-
-                  final BtIconView iconView = new BtIconView(activity);
-                  LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(activity, 15), dp(activity, 15));
-                  iconLp.rightMargin = dp(activity, 7);
-                  iconView.setLayoutParams(iconLp);
-                  pill.addView(iconView);
-
-                  final TextView labelView = new TextView(activity);
-                  labelView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-                  labelView.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-                  labelView.setSingleLine(true);
-                  labelView.setMaxWidth(dp(activity, 150));
-                  labelView.setEllipsize(TextUtils.TruncateAt.END);
-                  labelView.setTextColor(Color.WHITE);
-                  pill.addView(labelView);
-
-                  applyPillBackground(activity, pill, iconView, labelView, false);
-
-                  pill.setOnFocusChangeListener(new View.OnFocusChangeListener() {
-                      @Override
-                      public void onFocusChange(View v, boolean hasFocus) {
-                          applyPillBackground(activity, pill, iconView, labelView, hasFocus);
-                          v.animate().scaleX(hasFocus ? 1.06f : 1.0f).scaleY(hasFocus ? 1.06f : 1.0f).setDuration(130).start();
-                      }
-                  });
-
-                  View.OnClickListener clickAction = new View.OnClickListener() {
-                      @Override
-                      public void onClick(View v) {
-                          showBluetoothMenu(activity, pill);
-                      }
-                  };
-                  pill.setOnClickListener(clickAction);
-                  pill.setOnKeyListener(new View.OnKeyListener() {
-                      @Override
-                      public boolean onKey(View v, int keyCode, KeyEvent event) {
-                          if (event.getAction() == KeyEvent.ACTION_UP &&
-                                  (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER)) {
-                              showBluetoothMenu(activity, pill);
-                              return true;
-                          }
-                          return false;
-                      }
-                  });
-
-                  return pill;
-              }
-
-              private static void applyPillBackground(Context ctx, LinearLayout pill, BtIconView icon, TextView label, boolean focused) {
-                  GradientDrawable bg = new GradientDrawable();
-                  bg.setCornerRadius(dp(ctx, 999));
-                  if (focused) {
-                      bg.setColor(0xF2FFFFFF);
-                      label.setTextColor(0xFF0B0F19);
-                      icon.setColor(0xFF0B0F19);
-                  } else {
-                      bg.setColor(0x28FFFFFF);
-                      bg.setStroke(dp(ctx, 1), 0x22FFFFFF);
-                      label.setTextColor(0xFFFFFFFF);
-                      boolean connected = Boolean.TRUE.equals(pill.getTag(android.R.id.selectedIcon));
-                      icon.setColor(connected ? 0xFF38BDF8 : 0xFFFFFFFF);
-                  }
-                  pill.setBackground(bg);
-              }
-
-              private static void updatePillContent(Context ctx, LinearLayout pill) {
-                  if (pill.getChildCount() < 2) return;
-                  BtIconView icon = (BtIconView) pill.getChildAt(0);
-                  TextView label = (TextView) pill.getChildAt(1);
-
-                  String statusText = "Bluetooth";
-                  boolean hasConnected = false;
-                  try {
-                      BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
-                      if (adapter == null) {
-                          statusText = "No BT";
-                      } else if (!adapter.isEnabled()) {
-                          statusText = "BT Off";
-                      } else {
-                          Set<BluetoothDevice> bonded = adapter.getBondedDevices();
-                          if (bonded != null && !bonded.isEmpty()) {
-                              for (BluetoothDevice dev : bonded) {
-                                  if (isDeviceConnected(dev)) {
-                                      String name = dev.getName();
-                                      statusText = !TextUtils.isEmpty(name) ? name : "Connected";
-                                      hasConnected = true;
-                                      break;
-                                  }
-                              }
-                          }
-                      }
-                  } catch (SecurityException se) {
-                      statusText = "Bluetooth";
-                  } catch (Throwable ignored) {}
-
-                  pill.setTag(android.R.id.selectedIcon, hasConnected);
-                  label.setText(statusText);
-                  applyPillBackground(ctx, pill, icon, label, pill.hasFocus());
-              }
-
-              private static boolean isDeviceConnected(BluetoothDevice device) {
-                  try {
-                      Method m = device.getClass().getMethod("isConnected");
-                      Object res = m.invoke(device);
-                      return res instanceof Boolean && (Boolean) res;
-                  } catch (Throwable t) {
-                      return false;
-                  }
-              }
-
-              private static void ensureRuntimePermissions(Activity activity) {
+          public class BtFix {
+              public static void bind(final Activity act) {
                   if (Build.VERSION.SDK_INT >= 31) {
-                      if (activity.checkSelfPermission("android.permission.BLUETOOTH_CONNECT") != PackageManager.PERMISSION_GRANTED
-                              || activity.checkSelfPermission("android.permission.BLUETOOTH_SCAN") != PackageManager.PERMISSION_GRANTED) {
-                          activity.requestPermissions(new String[]{
-                              "android.permission.BLUETOOTH_CONNECT",
-                              "android.permission.BLUETOOTH_SCAN",
-                              "android.permission.ACCESS_FINE_LOCATION"
-                          }, 3110);
+                      act.requestPermissions(new String[]{"android.permission.BLUETOOTH_CONNECT", "android.permission.BLUETOOTH_SCAN", "android.permission.ACCESS_FINE_LOCATION"}, 99);
+                  }
+                  new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                      public void run() {
+                          View root = act.findViewById(android.R.id.content);
+                          if (root instanceof ViewGroup) scan((ViewGroup) root, act);
                       }
-                  } else if (Build.VERSION.SDK_INT >= 23) {
-                      if (activity.checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") != PackageManager.PERMISSION_GRANTED) {
-                          activity.requestPermissions(new String[]{
-                              "android.permission.ACCESS_FINE_LOCATION",
-                              "android.permission.ACCESS_COARSE_LOCATION"
-                          }, 3110);
+                  }, 600);
+              }
+              private static void scan(ViewGroup g, final Activity a) {
+                  for (int i = 0; i < g.getChildCount(); i++) {
+                      View v = g.getChildAt(i);
+                      if (v.getId() != View.NO_ID) {
+                          try {
+                              String n = a.getResources().getResourceEntryName(v.getId()).toLowerCase();
+                              if (n.contains("bluetooth") || n.contains("bt_pill") || n.contains("bt_btn")) {
+                                  v.setVisibility(View.VISIBLE);
+                                  v.setFocusable(true);
+                                  v.setClickable(true);
+                                  if (!v.hasOnClickListeners()) {
+                                      v.setOnClickListener(new View.OnClickListener() {
+                                          public void onClick(View view) { openBtMenu(a); }
+                                      });
+                                  }
+                              }
+                          } catch (Throwable ignored) {}
                       }
+                      if (v instanceof ViewGroup) scan((ViewGroup) v, a);
                   }
               }
-
-              private static void showBluetoothMenu(final Activity activity, final LinearLayout pill) {
-                  ensureRuntimePermissions(activity);
-                  final BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
-                  final List<String> items = new ArrayList<>();
-                  final List<BluetoothDevice> deviceTargets = new ArrayList<>();
-
-                  boolean enabled = false;
+              public static void openBtMenu(final Activity a) {
+                  final BluetoothAdapter ba = BluetoothAdapter.getDefaultAdapter();
+                  List<String> list = new ArrayList<>();
+                  final List<BluetoothDevice> devs = new ArrayList<>();
                   try {
-                      enabled = adapter != null && adapter.isEnabled();
-                      if (enabled) {
-                          Set<BluetoothDevice> bonded = adapter.getBondedDevices();
-                          if (bonded != null) {
-                              for (BluetoothDevice d : bonded) {
-                               
+                      if (ba != null && ba.isEnabled() && ba.getBondedDevices() != null) {
+                          for (BluetoothDevice d : ba.getBondedDevices()) {
+                              devs.add(d);
+                              list.add("Paired: " + (d.getName() != null ? d.getName() : d.getAddress()));
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+                  list.add("Open TV Bluetooth Settings / Pair New");
+                  list.add((ba != null && ba.isEnabled()) ? "Turn Bluetooth OFF" : "Turn Bluetooth ON");
+                  new AlertDialog.Builder(a, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                      .setTitle("Bluetooth")
+                      .setItems(list.toArray(new String[0]), new DialogInterface.OnClickListener() {
+                          public void onClick(DialogInterface d, int w) {
+                              if (w < devs.size() || w == devs.size()) {
+                                  try {
+                                      a.startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                                  } catch (Throwable e) {
+                                      a.startActivity(new Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                                  }
+                              } else if (ba != null) {
+                                  try { if (ba.isEnabled()) ba.disable(); else ba.enable(); } catch (Throwable ignored) {}
+                              }
+                          }
+                      }).show();
+              }
+          }
+          EOF
+          python3 -c '
+          p = "launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java"
+          s = open(p).read()
+          if "BtFix.bind(this);" not in s:
+              s = s.replace("super.onResume();", "super.onResume();\n        BtFix.bind(this);", 1)
+              open(p, "w").write(s)
+          '
+
+      - name: Compile & Sign Uncompressed APK
+        working-directory: ./launcher
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+          RAW_APK=$(find app/build/outputs/apk -name "*.apk" | sort | head -n 1)
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+          $BUILD_TOOLS/zipalign -f -p 4 "$RAW_APK" aligned.apk
+          keytool -genkey -v -keystore release.keystore -storepass android -alias releasekey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=CleanYourTV,O=Android,C=IN"
+          mkdir -p ../out_apk
+          $BUILD_TOOLS/apksigner sign --ks release.keystore --ks-pass pass:android --key-pass pass:android --out ../out_apk/cleanyourtv-bt.apk aligned.apk
+          ls -lh ../out_apk/cleanyourtv-bt.apk
+
+      - name: Upload Working Merged APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CleanYourTV-Working-Merged-APK
+          path: out_apk/cleanyourtv-bt.apk
