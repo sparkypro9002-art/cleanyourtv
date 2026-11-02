@@ -107,7 +107,7 @@ jobs:
                   try {
                       final Window.Callback orig = a.getWindow().getCallback();
                       if (orig == null) return;
-                      a.getWindow().setCallback((Window.Callback) Proxy.newProxyInstance(
+                      a.getWindow().setCallback((Window.Callback) java.lang.reflect.Proxy.newProxyInstance(
                           Window.Callback.class.getClassLoader(),
                           new Class[]{Window.Callback.class},
                           new InvocationHandler() {
