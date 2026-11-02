@@ -26,7 +26,7 @@ jobs:
           git fetch origin pull/311/head:pr-311
           git checkout -f pr-311
 
-      - name: Inject Fixed Dock, Showcase, Bluetooth Pill & Download Wallpapers
+      - name: Inject Fixed Dock, D-Pad Up/Down Navigation, Bluetooth Pill & Wallpapers
         run: |
           cat << 'EOF' > launcher/app/src/main/java/com/gathin/tvhome/UiUpgrade.java
           package com.gathin.tvhome;
@@ -45,6 +45,7 @@ jobs:
           import android.view.*;
           import android.widget.*;
           import java.io.File;
+          import java.lang.reflect.*;
           import java.text.SimpleDateFormat;
           import java.util.*;
 
@@ -55,6 +56,7 @@ jobs:
               private static TextView centerTitle, centerSub;
               private static LinearLayout centerCard, dockStrip;
               private static HorizontalScrollView dockScroll;
+              private static View lastFocusedDockSlot, btPillView;
               private static ColorMatrixColorFilter dullFilter;
               private static String activeKey = "";
               private static List<File> activeFiles = new ArrayList<>();
@@ -65,6 +67,8 @@ jobs:
               public static void apply(final Activity a) {
                   dockBuilt = false;
                   bgOverlay = null;
+                  lastFocusedDockSlot = null;
+                  btPillView = null;
                   ColorMatrix cm = new ColorMatrix();
                   cm.setSaturation(0.3f);
                   dullFilter = new ColorMatrixColorFilter(cm);
@@ -75,6 +79,7 @@ jobs:
                           "android.permission.ACCESS_FINE_LOCATION"
                       }, 101);
                   }
+                  installDpadNavigationHook(a);
                   Runnable tick = new Runnable() {
                       public void run() {
                           if (a.isFinishing() || a.isDestroyed()) return;
@@ -83,6 +88,7 @@ jobs:
                               if (root instanceof ViewGroup) {
                                   setupCustomDesktop(a, (ViewGroup) root);
                                   ensureBluetoothPill(a, (ViewGroup) root);
+                                  fixTopBarFocus((ViewGroup) root);
                                   upgradeClockAndDate((ViewGroup) root, a);
                                   upgradeDynamicWifi((ViewGroup) root, a);
                               }
@@ -91,6 +97,90 @@ jobs:
                       }
                   };
                   H.postDelayed(tick, 250);
+              }
+
+              private static void installDpadNavigationHook(final Activity a) {
+                  try {
+                      final Window.Callback orig = a.getWindow().getCallback();
+                      if (orig == null) return;
+                      a.getWindow().setCallback((Window.Callback) Proxy.newProxyInstance(
+                          Window.Callback.class.getClassLoader(),
+                          new Class[]{Window.Callback.class},
+                          new InvocationHandler() {
+                              public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+                                  if ("dispatchKeyEvent".equals(method.getName()) && args != null && args.length == 1 && args[0] instanceof KeyEvent) {
+                                      KeyEvent ev = (KeyEvent) args[0];
+                                      if (ev.getAction() == KeyEvent.ACTION_DOWN) {
+                                          View cur = a.getCurrentFocus();
+                                          int code = ev.getKeyCode();
+                                          if (code == KeyEvent.KEYCODE_DPAD_DOWN && (cur == null || !isInsideDock(cur))) {
+                                              if (focusDock()) return true;
+                                          } else if (code == KeyEvent.KEYCODE_DPAD_UP && cur != null && isInsideDock(cur)) {
+                                              if (focusTopBar(a)) return true;
+                                          }
+                                      }
+                                  }
+                                  try {
+                                      return method.invoke(orig, args);
+                                  } catch (InvocationTargetException e) {
+                                      throw e.getCause();
+                                  }
+                              }
+                          }
+                      ));
+                  } catch (Throwable ignored) {}
+              }
+
+              private static boolean isInsideDock(View v) {
+                  if (dockStrip == null || v == null) return false;
+                  ViewParent p = v.getParent();
+                  while (p != null) {
+                      if (p == dockStrip || p == dockScroll) return true;
+                      p = p.getParent();
+                  }
+                  return false;
+              }
+
+              private static boolean focusDock() {
+                  if (dockStrip == null || dockStrip.getChildCount() == 0) return false;
+                  View target = (lastFocusedDockSlot != null && lastFocusedDockSlot.getParent() == dockStrip)
+                      ? lastFocusedDockSlot : dockStrip.getChildAt(0);
+                  if (target != null) {
+                      target.requestFocus();
+                      return true;
+                  }
+                  return false;
+              }
+
+              private static boolean focusTopBar(Activity a) {
+                  if (btPillView != null && btPillView.getVisibility() == View.VISIBLE && btPillView.requestFocus()) {
+                      return true;
+                  }
+                  View root = a.findViewById(android.R.id.content);
+                  if (root instanceof ViewGroup) {
+                      View s = findSettingsPill((ViewGroup) root, a);
+                      if (s != null && s.requestFocus()) return true;
+                  }
+                  return false;
+              }
+
+              private static void fixTopBarFocus(ViewGroup g) {
+                  for (int i = 0; i < g.getChildCount(); i++) {
+                      View v = g.getChildAt(i);
+                      if (v == dockScroll || v == dockStrip) continue;
+                      if (v.isFocusable()) {
+                          v.setNextFocusDownId(View.NO_ID);
+                          v.setOnKeyListener(new View.OnKeyListener() {
+                              public boolean onKey(View view, int keyCode, KeyEvent event) {
+                                  if (event.getAction() == KeyEvent.ACTION_DOWN && keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
+                                      return focusDock();
+                                  }
+                                  return false;
+                              }
+                          });
+                      }
+                      if (v instanceof ViewGroup) fixTopBarFocus((ViewGroup) v);
+                  }
               }
 
               private static void setupCustomDesktop(final Activity a, ViewGroup content) {
@@ -150,6 +240,7 @@ jobs:
                   dockScroll.setHorizontalScrollBarEnabled(false);
                   dockScroll.setClipToPadding(false);
                   dockScroll.setClipChildren(false);
+                  dockScroll.setFocusable(false);
                   GradientDrawable dbg = new GradientDrawable();
                   dbg.setColor(0x990A0E17);
                   dbg.setCornerRadius(dp(a, 20));
@@ -160,6 +251,7 @@ jobs:
                   dockStrip = new LinearLayout(a);
                   dockStrip.setOrientation(LinearLayout.HORIZONTAL);
                   dockStrip.setGravity(Gravity.CENTER_VERTICAL);
+                  dockStrip.setFocusable(false);
                   dockScroll.addView(dockStrip, new FrameLayout.LayoutParams(-2, -2));
 
                   FrameLayout.LayoutParams dlp = new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
@@ -174,7 +266,10 @@ jobs:
 
               private static void ensureBluetoothPill(final Activity a, ViewGroup root) {
                   View existing = root.findViewWithTag("CYTV_BT_PILL");
-                  if (existing != null) return;
+                  if (existing != null) {
+                      btPillView = existing;
+                      return;
+                  }
                   View settingsView = findSettingsPill(root, a);
                   if (settingsView == null || !(settingsView.getParent() instanceof LinearLayout)) return;
                   LinearLayout topBar = (LinearLayout) settingsView.getParent();
@@ -186,7 +281,9 @@ jobs:
                               String n = a.getResources().getResourceEntryName(c.getId()).toLowerCase();
                               if (n.contains("bluetooth") || n.contains("bt")) {
                                   c.setVisibility(View.VISIBLE);
+                                  c.setFocusable(true);
                                   c.setTag("CYTV_BT_PILL");
+                                  btPillView = c;
                                   return;
                               }
                           } catch (Throwable ignored) {}
@@ -227,6 +324,7 @@ jobs:
                   lp.leftMargin = dp(a, 8);
                   lp.gravity = Gravity.CENTER_VERTICAL;
                   topBar.addView(btPill, 0, lp);
+                  btPillView = btPill;
               }
 
               private static void openBtDialog(final Activity a) {
@@ -352,12 +450,21 @@ jobs:
                           public void onFocusChange(View v, boolean hasFocus) {
                               styleDockItem(a, slot, iv, hasFocus);
                               if (hasFocus) {
+                                  lastFocusedDockSlot = v;
                                   int scrollX = (v.getLeft() + v.getRight()) / 2 - dockScroll.getWidth() / 2;
                                   dockScroll.smoothScrollTo(Math.max(0, scrollX), 0);
                                   if (iconDraw != null) centerIcon.setImageDrawable(iconDraw);
                                   centerTitle.setText(label);
                                   updateCustomWallpaper(pkg + " " + label);
                               }
+                          }
+                      });
+                      slot.setOnKeyListener(new View.OnKeyListener() {
+                          public boolean onKey(View v, int keyCode, KeyEvent event) {
+                              if (event.getAction() == KeyEvent.ACTION_DOWN && keyCode == KeyEvent.KEYCODE_DPAD_UP) {
+                                  return focusTopBar(a);
+                              }
+                              return false;
                           }
                       });
                       slot.setOnClickListener(new View.OnClickListener() {
@@ -375,7 +482,10 @@ jobs:
                           }
                       });
                       dockStrip.addView(slot);
-                      if (i == 0) H.postDelayed(new Runnable() { public void run() { slot.requestFocus(); } }, 300);
+                      if (i == 0) {
+                          lastFocusedDockSlot = slot;
+                          H.postDelayed(new Runnable() { public void run() { slot.requestFocus(); } }, 300);
+                      }
                   }
               }
 
