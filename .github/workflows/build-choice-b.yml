@@ -27,7 +27,11 @@ jobs:
           git checkout -f pr-311
 
       - name: Inject Fixed Dock, D-Pad Up/Down Navigation, Bluetooth Pill & Wallpapers
+        shell: bash
         run: |
+          set -euo pipefail
+          test -f launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java
+          test -f launcher/app/src/main/AndroidManifest.xml
           cat << 'EOF' > launcher/app/src/main/java/com/gathin/tvhome/UiUpgrade.java
           package com.gathin.tvhome;
           import android.app.*;
@@ -702,10 +706,18 @@ jobs:
           python3 - << 'PYEOF'
           import re
           p = "launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java"
-          s = open(p).read()
+          with open(p, encoding="utf-8") as f:
+              s = f.read()
           if "UiUpgrade.apply(this);" not in s:
-              s = re.sub(r'(super\.onCreate\s*\([^)]*\)\s*;)', r'\1\n        UiUpgrade.apply(this);', s, count=1)
-              open(p, "w").write(s)
+              s, n = re.subn(
+                  r'(super\.onCreate\s*\([^)]*\)\s*;)',
+                  r'\1\n        UiUpgrade.apply(this);',
+                  s, count=1
+              )
+              if n != 1:
+                  raise SystemExit("ERROR: Could not locate MainActivity.onCreate() super call; refusing to build.")
+              with open(p, "w", encoding="utf-8") as f:
+                  f.write(s)
 
           mf = "launcher/app/src/main/AndroidManifest.xml"
           m = open(mf).read()
@@ -724,20 +736,56 @@ jobs:
           open(mf, "w").write(m)
           PYEOF
 
-      - name: Compile & Sign Uncompressed APK
+      - name: Compile, Align & Sign APK
+        shell: bash
         working-directory: ./launcher
         run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug
-          RAW_APK=$(find app/build/outputs/apk -name "*.apk" | sort | head -n 1)
-          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
-          $BUILD_TOOLS/zipalign -f -p 4 "$RAW_APK" aligned.apk
-          keytool -genkey -v -keystore release.keystore -storepass android -alias releasekey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=TV,O=Android,C=IN"
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon clean assembleDebug
+
+          RAW_APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [[ ! -f "$RAW_APK" ]]; then
+            echo "ERROR: Expected debug APK not found: $RAW_APK"
+            find app/build/outputs/apk -type f -name '*.apk' -print || true
+            exit 1
+          fi
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          if [[ -z "$BUILD_TOOLS" || ! -x "$BUILD_TOOLS/zipalign" || ! -x "$BUILD_TOOLS/apksigner" ]]; then
+            echo "ERROR: Android build-tools zipalign/apksigner not found."
+            exit 1
+          fi
+
           mkdir -p ../out_apk
-          $BUILD_TOOLS/apksigner sign --ks release.keystore --ks-pass pass:android --key-pass pass:android --out ../out_apk/cleanyourtv-bt.apk aligned.apk
+          "$BUILD_TOOLS/zipalign" -f -p 4 "$RAW_APK" aligned.apk
+
+          # Use repository secrets for a stable signing key when available.
+          # Otherwise create a temporary key for this run (updates across runs
+          # will require uninstalling the previous APK first).
+          if [[ -n "${{ secrets.APK_KEYSTORE_BASE64 }}" ]]; then
+            echo "${{ secrets.APK_KEYSTORE_BASE64 }}" | base64 --decode > release.keystore
+            KS_PASS="${{ secrets.APK_KEYSTORE_PASSWORD }}"
+            KEY_PASS="${{ secrets.APK_KEY_PASSWORD }}"
+            KEY_ALIAS="${{ secrets.APK_KEY_ALIAS }}"
+          else
+            keytool -genkeypair -keystore release.keystore -storepass android \
+              -alias releasekey -keypass android -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=CleanYourTV,O=Android,C=IN"
+            KS_PASS="android"
+            KEY_PASS="android"
+            KEY_ALIAS="releasekey"
+          fi
+
+          "$BUILD_TOOLS/apksigner" sign --ks release.keystore \
+            --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" \
+            --ks-key-alias "$KEY_ALIAS" --out ../out_apk/cleanyourtv-bt.apk aligned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose ../out_apk/cleanyourtv-bt.apk
+          test -s ../out_apk/cleanyourtv-bt.apk
 
       - name: Upload Fixed All-In-One APK
         uses: actions/upload-artifact@v4
         with:
           name: CleanYourTV-Fixed-AllInOne-APK
           path: out_apk/cleanyourtv-bt.apk
+          if-no-files-found: error
