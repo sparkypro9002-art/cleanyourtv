@@ -1,4 +1,4 @@
-name: Build Working BT + Bottom Dock APK
+name: Build Fixed CleanYourTV All-In-One APK
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout CleanYourTV Repository
         uses: actions/checkout@v4
         with:
           repository: Gathin23/cleanyourtv
@@ -21,12 +21,600 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Switch to Working Bluetooth Branch
+      - name: Switch to Working Bluetooth Branch (PR #311)
         run: |
           git fetch origin pull/311/head:pr-311
           git checkout -f pr-311
 
-      - name: Compile & Sign APK
+      - name: Inject Fixed Dock, Showcase, Bluetooth Pill & Download Wallpapers
+        run: |
+          cat << 'EOF' > launcher/app/src/main/java/com/gathin/tvhome/UiUpgrade.java
+          package com.gathin.tvhome;
+          import android.app.*;
+          import android.bluetooth.*;
+          import android.content.*;
+          import android.content.pm.*;
+          import android.graphics.*;
+          import android.graphics.drawable.*;
+          import android.net.*;
+          import android.net.wifi.*;
+          import android.os.*;
+          import android.provider.Settings;
+          import android.text.TextUtils;
+          import android.util.*;
+          import android.view.*;
+          import android.widget.*;
+          import java.io.File;
+          import java.text.SimpleDateFormat;
+          import java.util.*;
+
+          public class UiUpgrade {
+              private static final Handler H = new Handler(Looper.getMainLooper());
+              private static final LruCache<String, Bitmap> CACHE = new LruCache<>(8);
+              private static ImageView bgOverlay, centerIcon;
+              private static TextView centerTitle, centerSub;
+              private static LinearLayout centerCard, dockStrip;
+              private static HorizontalScrollView dockScroll;
+              private static ColorMatrixColorFilter dullFilter;
+              private static String activeKey = "";
+              private static List<File> activeFiles = new ArrayList<>();
+              private static int slideIdx = 0;
+              private static Runnable slideTask;
+              private static boolean dockBuilt = false;
+
+              public static void apply(final Activity a) {
+                  dockBuilt = false;
+                  bgOverlay = null;
+                  ColorMatrix cm = new ColorMatrix();
+                  cm.setSaturation(0.3f);
+                  dullFilter = new ColorMatrixColorFilter(cm);
+                  if (Build.VERSION.SDK_INT >= 23) {
+                      a.requestPermissions(new String[]{
+                          "android.permission.READ_EXTERNAL_STORAGE",
+                          "android.permission.WRITE_EXTERNAL_STORAGE",
+                          "android.permission.ACCESS_FINE_LOCATION"
+                      }, 101);
+                  }
+                  Runnable tick = new Runnable() {
+                      public void run() {
+                          if (a.isFinishing() || a.isDestroyed()) return;
+                          try {
+                              View root = a.findViewById(android.R.id.content);
+                              if (root instanceof ViewGroup) {
+                                  setupCustomDesktop(a, (ViewGroup) root);
+                                  ensureBluetoothPill(a, (ViewGroup) root);
+                                  upgradeClockAndDate((ViewGroup) root, a);
+                                  upgradeDynamicWifi((ViewGroup) root, a);
+                              }
+                          } catch (Throwable ignored) {}
+                          H.postDelayed(this, 3000);
+                      }
+                  };
+                  H.postDelayed(tick, 250);
+              }
+
+              private static void setupCustomDesktop(final Activity a, ViewGroup content) {
+                  if (dockBuilt || content.getChildCount() == 0) return;
+                  View first = content.getChildAt(0);
+                  if (!(first instanceof ViewGroup)) return;
+                  ViewGroup mainRoot = (ViewGroup) first;
+                  dockBuilt = true;
+
+                  hideOnlyOldAppContainers(mainRoot, a);
+
+                  bgOverlay = new ImageView(a);
+                  bgOverlay.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                  bgOverlay.setColorFilter(0x44000000, PorterDuff.Mode.SRC_OVER);
+                  bgOverlay.setAlpha(0f);
+                  int bgIdx = (mainRoot.getChildCount() > 0 && mainRoot.getChildAt(0) instanceof ImageView) ? 1 : 0;
+                  mainRoot.addView(bgOverlay, bgIdx, new ViewGroup.LayoutParams(-1, -1));
+
+                  FrameLayout uiLayer = new FrameLayout(a);
+                  FrameLayout.LayoutParams ulp = new FrameLayout.LayoutParams(-1, -1);
+                  ulp.topMargin = dp(a, 92);
+                  uiLayer.setLayoutParams(ulp);
+
+                  centerCard = new LinearLayout(a);
+                  centerCard.setOrientation(LinearLayout.VERTICAL);
+                  centerCard.setGravity(Gravity.CENTER);
+                  int p = dp(a, 22);
+                  centerCard.setPadding(p, dp(a, 16), p, dp(a, 16));
+                  GradientDrawable cbg = new GradientDrawable();
+                  cbg.setColor(0x88080C14);
+                  cbg.setCornerRadius(dp(a, 22));
+                  cbg.setStroke(dp(a, 1), 0x44FFFFFF);
+                  centerCard.setBackground(cbg);
+
+                  centerIcon = new ImageView(a);
+                  centerIcon.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                  centerCard.addView(centerIcon, new LinearLayout.LayoutParams(dp(a, 76), dp(a, 76)));
+
+                  centerTitle = new TextView(a);
+                  centerTitle.setTextColor(Color.WHITE);
+                  centerTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f);
+                  centerTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+                  centerTitle.setPadding(0, dp(a, 8), 0, dp(a, 2));
+                  centerCard.addView(centerTitle, new LinearLayout.LayoutParams(-2, -2));
+
+                  centerSub = new TextView(a);
+                  centerSub.setTextColor(0xBBFFFFFF);
+                  centerSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+                  centerSub.setText("Press OK to open  •  Hold OK for App Info");
+                  centerCard.addView(centerSub, new LinearLayout.LayoutParams(-2, -2));
+
+                  FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER);
+                  clp.bottomMargin = dp(a, 42);
+                  uiLayer.addView(centerCard, clp);
+
+                  dockScroll = new HorizontalScrollView(a);
+                  dockScroll.setHorizontalScrollBarEnabled(false);
+                  dockScroll.setClipToPadding(false);
+                  dockScroll.setClipChildren(false);
+                  GradientDrawable dbg = new GradientDrawable();
+                  dbg.setColor(0x990A0E17);
+                  dbg.setCornerRadius(dp(a, 20));
+                  dbg.setStroke(dp(a, 1), 0x33FFFFFF);
+                  dockScroll.setBackground(dbg);
+                  dockScroll.setPadding(dp(a, 18), dp(a, 10), dp(a, 18), dp(a, 10));
+
+                  dockStrip = new LinearLayout(a);
+                  dockStrip.setOrientation(LinearLayout.HORIZONTAL);
+                  dockStrip.setGravity(Gravity.CENTER_VERTICAL);
+                  dockScroll.addView(dockStrip, new FrameLayout.LayoutParams(-2, -2));
+
+                  FrameLayout.LayoutParams dlp = new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+                  dlp.leftMargin = dp(a, 28);
+                  dlp.rightMargin = dp(a, 28);
+                  dlp.bottomMargin = dp(a, 18);
+                  uiLayer.addView(dockScroll, dlp);
+
+                  content.addView(uiLayer);
+                  populateAllAppsDock(a);
+              }
+
+              private static void ensureBluetoothPill(final Activity a, ViewGroup root) {
+                  View existing = root.findViewWithTag("CYTV_BT_PILL");
+                  if (existing != null) return;
+                  View settingsView = findSettingsPill(root, a);
+                  if (settingsView == null || !(settingsView.getParent() instanceof LinearLayout)) return;
+                  LinearLayout topBar = (LinearLayout) settingsView.getParent();
+
+                  for (int i = 0; i < topBar.getChildCount(); i++) {
+                      View c = topBar.getChildAt(i);
+                      if (c.getId() != View.NO_ID) {
+                          try {
+                              String n = a.getResources().getResourceEntryName(c.getId()).toLowerCase();
+                              if (n.contains("bluetooth") || n.contains("bt")) {
+                                  c.setVisibility(View.VISIBLE);
+                                  c.setTag("CYTV_BT_PILL");
+                                  return;
+                              }
+                          } catch (Throwable ignored) {}
+                      }
+                  }
+
+                  final TextView btPill = new TextView(a);
+                  btPill.setTag("CYTV_BT_PILL");
+                  btPill.setText("ᛒ Bluetooth");
+                  btPill.setTextColor(Color.WHITE);
+                  btPill.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+                  btPill.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+                  btPill.setGravity(Gravity.CENTER);
+                  btPill.setFocusable(true);
+                  btPill.setClickable(true);
+                  btPill.setPadding(dp(a, 14), dp(a, 7), dp(a, 14), dp(a, 7));
+
+                  final GradientDrawable bgNorm = new GradientDrawable();
+                  bgNorm.setColor(0x33FFFFFF);
+                  bgNorm.setCornerRadius(dp(a, 99));
+                  final GradientDrawable bgFoc = new GradientDrawable();
+                  bgFoc.setColor(Color.WHITE);
+                  bgFoc.setCornerRadius(dp(a, 99));
+                  btPill.setBackground(bgNorm);
+
+                  btPill.setOnFocusChangeListener(new View.OnFocusChangeListener() {
+                      public void onFocusChange(View v, boolean hasFocus) {
+                          btPill.setBackground(hasFocus ? bgFoc : bgNorm);
+                          btPill.setTextColor(hasFocus ? 0xFF0B0F19 : Color.WHITE);
+                      }
+                  });
+                  btPill.setOnClickListener(new View.OnClickListener() {
+                      public void onClick(View v) { openBtDialog(a); }
+                  });
+
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
+                  lp.rightMargin = dp(a, 8);
+                  lp.leftMargin = dp(a, 8);
+                  lp.gravity = Gravity.CENTER_VERTICAL;
+                  topBar.addView(btPill, 0, lp);
+              }
+
+              private static void openBtDialog(final Activity a) {
+                  final BluetoothAdapter ba = BluetoothAdapter.getDefaultAdapter();
+                  List<String> items = new ArrayList<>();
+                  try {
+                      if (ba != null && ba.isEnabled() && ba.getBondedDevices() != null) {
+                          for (BluetoothDevice d : ba.getBondedDevices()) {
+                              items.add("Paired: " + (!TextUtils.isEmpty(d.getName()) ? d.getName() : d.getAddress()));
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+                  items.add("Open TV Bluetooth Settings / Pair Device");
+                  items.add((ba != null && ba.isEnabled()) ? "Turn Bluetooth OFF" : "Turn Bluetooth ON");
+                  new AlertDialog.Builder(a, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                      .setTitle("Bluetooth Accessories")
+                      .setItems(items.toArray(new String[0]), new DialogInterface.OnClickListener() {
+                          public void onClick(DialogInterface dialog, int which) {
+                              if (which == items.size() - 1 && ba != null) {
+                                  try { if (ba.isEnabled()) ba.disable(); else ba.enable(); } catch (Throwable ignored) {}
+                              } else {
+                                  try {
+                                      a.startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                                  } catch (Throwable e) {
+                                      a.startActivity(new Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                                  }
+                              }
+                          }
+                      }).show();
+              }
+
+              private static View findSettingsPill(ViewGroup g, Activity a) {
+                  for (int i = 0; i < g.getChildCount(); i++) {
+                      View v = g.getChildAt(i);
+                      if (v.getId() != View.NO_ID) {
+                          try {
+                              String n = a.getResources().getResourceEntryName(v.getId()).toLowerCase();
+                              if ((n.contains("setting") || n.contains("wifi")) && v.getParent() instanceof LinearLayout) {
+                                  LinearLayout p = (LinearLayout) v.getParent();
+                                  if (p.getOrientation() == LinearLayout.HORIZONTAL) return v;
+                                  if (p.getParent() instanceof LinearLayout) return p;
+                              }
+                          } catch (Throwable ignored) {}
+                      }
+                      if (v instanceof ViewGroup) {
+                          View f = findSettingsPill((ViewGroup) v, a);
+                          if (f != null) return f;
+                      }
+                  }
+                  return null;
+              }
+
+              private static void populateAllAppsDock(final Activity a) {
+                  final PackageManager pm = a.getPackageManager();
+                  final Map<String, CharSequence> map = new LinkedHashMap<>();
+                  Intent[] queries = {
+                      new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER),
+                      new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  };
+                  for (Intent q : queries) {
+                      try {
+                          List<ResolveInfo> list = pm.queryIntentActivities(q, 0);
+                          if (list != null) {
+                              for (ResolveInfo ri : list) {
+                                  String pkg = ri.activityInfo.packageName;
+                                  if (!pkg.equals(a.getPackageName()) && !pkg.equals("com.google.android.tvlauncher") && !map.containsKey(pkg)) {
+                                      map.put(pkg, ri.loadLabel(pm));
+                                  }
+                              }
+                          }
+                      } catch (Throwable ignored) {}
+                  }
+                  if (map.isEmpty()) {
+                      try {
+                          for (ApplicationInfo ai : pm.getInstalledApplications(0)) {
+                              String pkg = ai.packageName;
+                              if ((pm.getLeanbackLaunchIntentForPackage(pkg) != null || pm.getLaunchIntentForPackage(pkg) != null)
+                                      && !pkg.equals(a.getPackageName()) && !pkg.equals("com.google.android.tvlauncher")) {
+                                  map.put(pkg, ai.loadLabel(pm));
+                              }
+                          }
+                      } catch (Throwable ignored) {}
+                  }
+
+                  List<String> pkgs = new ArrayList<>(map.keySet());
+                  final String[] prio = {"netflix", "amazon", "prime", "youtube", "vending", "hotstar", "disney", "vlc", "termux", "zarchiver"};
+                  Collections.sort(pkgs, new Comparator<String>() {
+                      public int compare(String p1, String p2) {
+                          int r1 = rank(p1), r2 = rank(p2);
+                          if (r1 != r2) return r1 - r2;
+                          return String.valueOf(map.get(p1)).compareToIgnoreCase(String.valueOf(map.get(p2)));
+                      }
+                      int rank(String s) {
+                          s = s.toLowerCase(Locale.US);
+                          for (int i = 0; i < prio.length; i++) if (s.contains(prio[i])) return i;
+                          return 99;
+                      }
+                  });
+
+                  for (int i = 0; i < pkgs.size(); i++) {
+                      final String pkg = pkgs.get(i);
+                      final String label = String.valueOf(map.get(pkg));
+                      Drawable d = null;
+                      try { d = pm.getApplicationBanner(pkg); } catch (Throwable ignored) {}
+                      if (d == null) try { d = pm.getApplicationIcon(pkg); } catch (Throwable ignored) {}
+                      final Drawable iconDraw = d;
+
+                      final FrameLayout slot = new FrameLayout(a);
+                      slot.setFocusable(true);
+                      slot.setClickable(true);
+                      LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(dp(a, 66), dp(a, 66));
+                      slp.setMargins(dp(a, 7), dp(a, 4), dp(a, 7), dp(a, 4));
+                      slot.setLayoutParams(slp);
+
+                      final ImageView iv = new ImageView(a);
+                      iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                      if (iconDraw != null) iv.setImageDrawable(iconDraw);
+                      slot.addView(iv, new FrameLayout.LayoutParams(dp(a, 48), dp(a, 48), Gravity.CENTER));
+
+                      styleDockItem(a, slot, iv, false);
+
+                      slot.setOnFocusChangeListener(new View.OnFocusChangeListener() {
+                          public void onFocusChange(View v, boolean hasFocus) {
+                              styleDockItem(a, slot, iv, hasFocus);
+                              if (hasFocus) {
+                                  int scrollX = (v.getLeft() + v.getRight()) / 2 - dockScroll.getWidth() / 2;
+                                  dockScroll.smoothScrollTo(Math.max(0, scrollX), 0);
+                                  if (iconDraw != null) centerIcon.setImageDrawable(iconDraw);
+                                  centerTitle.setText(label);
+                                  updateCustomWallpaper(pkg + " " + label);
+                              }
+                          }
+                      });
+                      slot.setOnClickListener(new View.OnClickListener() {
+                          public void onClick(View v) {
+                              Intent li = pm.getLeanbackLaunchIntentForPackage(pkg);
+                              if (li == null) li = pm.getLaunchIntentForPackage(pkg);
+                              if (li != null) a.startActivity(li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                          }
+                      });
+                      slot.setOnLongClickListener(new View.OnLongClickListener() {
+                          public boolean onLongClick(View v) {
+                              Intent info = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + pkg));
+                              a.startActivity(info.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                              return true;
+                          }
+                      });
+                      dockStrip.addView(slot);
+                      if (i == 0) H.postDelayed(new Runnable() { public void run() { slot.requestFocus(); } }, 300);
+                  }
+              }
+
+              private static void styleDockItem(Context c, FrameLayout slot, ImageView iv, boolean focused) {
+                  GradientDrawable bg = new GradientDrawable();
+                  bg.setCornerRadius(dp(c, 16));
+                  if (focused) {
+                      bg.setColor(0x40FFFFFF);
+                      bg.setStroke(dp(c, 2), Color.WHITE);
+                      iv.setAlpha(1.0f);
+                      iv.clearColorFilter();
+                      slot.animate().scaleX(1.18f).scaleY(1.18f).setDuration(140).start();
+                  } else {
+                      bg.setColor(0x22000000);
+                      iv.setAlpha(0.35f);
+                      iv.setColorFilter(dullFilter);
+                      slot.animate().scaleX(0.92f).scaleY(0.92f).setDuration(140).start();
+                  }
+                  slot.setBackground(bg);
+              }
+
+              private static void updateCustomWallpaper(String raw) {
+                  String s = raw.toLowerCase(Locale.US);
+                  String key = "";
+                  if (s.contains("netflix")) key = "netflix";
+                  else if (s.contains("prime") || s.contains("amazon") || s.contains("avod")) key = "prime";
+                  else if (s.contains("youtube")) key = "youtube";
+                  else if (s.contains("vending") || s.contains("play store") || s.contains("playstore")) key = "playstore";
+                  else if (s.contains("hotstar") || s.contains("disney")) key = "hotstar";
+                  else if (s.contains("termux")) key = "termux";
+                  else if (s.contains("zarchiver")) key = "zarchiver";
+                  else if (s.contains("vlc")) key = "vlc";
+
+                  if (key.equals(activeKey)) return;
+                  activeKey = key;
+                  if (slideTask != null) H.removeCallbacks(slideTask);
+                  if (key.isEmpty()) {
+                      if (bgOverlay != null) bgOverlay.animate().alpha(0f).setDuration(240).start();
+                      return;
+                  }
+                  activeFiles = findWallpapers(key);
+                  if (activeFiles.isEmpty()) {
+                      if (bgOverlay != null) bgOverlay.animate().alpha(0f).setDuration(240).start();
+                      return;
+                  }
+                  slideIdx = 0;
+                  showWallpaper(activeFiles.get(0));
+                  if (activeFiles.size() > 1) {
+                      slideTask = new Runnable() {
+                          public void run() {
+                              slideIdx = (slideIdx + 1) % activeFiles.size();
+                              showWallpaper(activeFiles.get(slideIdx));
+                              H.postDelayed(this, 4000);
+                          }
+                      };
+                      H.postDelayed(slideTask, 4000);
+                  }
+              }
+
+              private static List<File> findWallpapers(String key) {
+                  List<File> res = new ArrayList<>();
+                  String[] dirs = {
+                      "/sdcard/Download",
+                      "/sdcard/Download/ww",
+                      "/sdcard/CustomWallpaper",
+                      "/sdcard/Custom Wallpaper",
+                      "/sdcard/Download/Custom Wallpaper"
+                  };
+                  for (String d : dirs) {
+                      File dir = new File(d);
+                      if (!dir.isDirectory()) continue;
+                      File[] list = dir.listFiles();
+                      if (list != null) {
+                          for (File f : list) {
+                              String n = f.getName().toLowerCase(Locale.US);
+                              boolean img = n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png") || n.endsWith(".webp");
+                              boolean m = n.contains(key)
+                                  || (key.equals("netflix") && n.contains("marvel"))
+                                  || (key.equals("prime") && n.contains("amazon"))
+                                  || (key.equals("playstore") && n.contains("play"));
+                              if (f.isFile() && img && m) res.add(f);
+                          }
+                      }
+                      if (!res.isEmpty()) break;
+                  }
+                  Collections.sort(res);
+                  return res;
+              }
+
+              private static void showWallpaper(File f) {
+                  if (bgOverlay == null || !f.exists()) return;
+                  String p = f.getAbsolutePath();
+                  Bitmap b = CACHE.get(p);
+                  if (b == null) {
+                      BitmapFactory.Options o = new BitmapFactory.Options();
+                      o.inSampleSize = 2;
+                      o.inPreferredConfig = Bitmap.Config.RGB_565;
+                      b = BitmapFactory.decodeFile(p, o);
+                      if (b != null) CACHE.put(p, b);
+                  }
+                  if (b != null) {
+                      bgOverlay.setImageBitmap(b);
+                      bgOverlay.animate().alpha(1f).setDuration(250).start();
+                  }
+              }
+
+              private static void hideOnlyOldAppContainers(ViewGroup g, Activity a) {
+                  for (int i = 0; i < g.getChildCount(); i++) {
+                      View c = g.getChildAt(i);
+                      String cls = c.getClass().getName().toLowerCase(Locale.US);
+                      if (cls.contains("recyclerview") || cls.contains("gridview") || cls.contains("viewpager")) {
+                          c.setVisibility(View.GONE);
+                          continue;
+                      }
+                      if (c.getId() != View.NO_ID) {
+                          try {
+                              String n = a.getResources().getResourceEntryName(c.getId()).toLowerCase();
+                              if (n.contains("dock") || n.contains("app_list") || n.contains("apps_row") || n.contains("favorite")) {
+                                  c.setVisibility(View.GONE);
+                                  continue;
+                              }
+                          } catch (Throwable ignored) {}
+                      }
+                      if (c instanceof ViewGroup) hideOnlyOldAppContainers((ViewGroup) c, a);
+                  }
+              }
+
+              private static void upgradeClockAndDate(ViewGroup root, Activity a) {
+                  TextView clock = findTv(root, a, new String[]{"clock", "time"});
+                  TextView date = findTv(root, a, new String[]{"date", "day"});
+                  if (clock == null) return;
+                  clock.setTextColor(Color.WHITE);
+                  if (date == null) {
+                      View t = root.findViewWithTag("BRIGHT_DATE");
+                      if (t instanceof TextView) date = (TextView) t;
+                  }
+                  if (date == null) {
+                      date = new TextView(a);
+                      date.setTag("BRIGHT_DATE");
+                      date.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
+                  }
+                  date.setVisibility(View.VISIBLE);
+                  date.setTextColor(Color.WHITE);
+                  date.setText(new SimpleDateFormat("EEE, MMM d", Locale.getDefault()).format(new Date()));
+                  if (clock.getParent() instanceof LinearLayout) {
+                      LinearLayout p = (LinearLayout) clock.getParent();
+                      if (p.getOrientation() == LinearLayout.VERTICAL && date.getParent() == p) return;
+                      int idx = p.indexOfChild(clock);
+                      ViewGroup.LayoutParams lp = clock.getLayoutParams();
+                      p.removeView(clock);
+                      if (date.getParent() instanceof ViewGroup) ((ViewGroup) date.getParent()).removeView(date);
+                      LinearLayout box = new LinearLayout(a);
+                      box.setOrientation(LinearLayout.VERTICAL);
+                      box.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+                      box.setLayoutParams(lp);
+                      box.addView(clock, new LinearLayout.LayoutParams(-2, -2));
+                      box.addView(date, new LinearLayout.LayoutParams(-2, -2));
+                      p.addView(box, Math.max(0, idx));
+                  }
+              }
+
+              private static void upgradeDynamicWifi(ViewGroup root, Activity a) {
+                  int color = 0xFFFF4D4D;
+                  try {
+                      WifiManager wm = (WifiManager) a.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                      ConnectivityManager cm = (ConnectivityManager) a.getSystemService(Context.CONNECTIVITY_SERVICE);
+                      NetworkInfo ni = cm != null ? cm.getActiveNetworkInfo() : null;
+                      if (wm != null && wm.isWifiEnabled() && ni != null && ni.isConnected()) {
+                          WifiInfo wi = wm.getConnectionInfo();
+                          color = (wi != null && wi.getRssi() < -72) ? 0xFFFFB020 : 0xFF2ECC71;
+                      }
+                  } catch (Throwable ignored) {}
+                  tintWifi(root, a, color, false);
+              }
+
+              private static void tintWifi(ViewGroup g, Activity a, int c, boolean inW) {
+                  for (int i = 0; i < g.getChildCount(); i++) {
+                      View v = g.getChildAt(i);
+                      boolean w = inW;
+                      if (!w && v.getId() != View.NO_ID) {
+                          try {
+                              String n = a.getResources().getResourceEntryName(v.getId()).toLowerCase();
+                              if (n.contains("wifi") || n.contains("network")) w = true;
+                          } catch (Throwable ignored) {}
+                      }
+                      if (w && v instanceof ImageView) ((ImageView) v).setColorFilter(c, PorterDuff.Mode.SRC_IN);
+                      if (v instanceof ViewGroup) tintWifi((ViewGroup) v, a, c, w);
+                  }
+              }
+
+              private static TextView findTv(ViewGroup g, Activity a, String[] keys) {
+                  for (int i = 0; i < g.getChildCount(); i++) {
+                      View v = g.getChildAt(i);
+                      if (v instanceof TextView && v.getId() != View.NO_ID) {
+                          try {
+                              String n = a.getResources().getResourceEntryName(v.getId()).toLowerCase();
+                              for (String k : keys) if (n.contains(k)) return (TextView) v;
+                          } catch (Throwable ignored) {}
+                      }
+                      if (v instanceof ViewGroup) {
+                          TextView f = findTv((ViewGroup) v, a, keys);
+                          if (f != null) return f;
+                      }
+                  }
+                  return null;
+              }
+
+              private static int dp(Context c, int v) {
+                  return Math.round(v * c.getResources().getDisplayMetrics().density);
+              }
+          }
+          EOF
+
+          python3 - << 'PYEOF'
+          import re
+          p = "launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java"
+          s = open(p).read()
+          if "UiUpgrade.apply(this);" not in s:
+              s = re.sub(r'(super\.onCreate\s*\([^)]*\)\s*;)', r'\1\n        UiUpgrade.apply(this);', s, count=1)
+              open(p, "w").write(s)
+
+          mf = "launcher/app/src/main/AndroidManifest.xml"
+          m = open(mf).read()
+          m = re.sub(r'android:maxSdkVersion="\d+"', '', m)
+          if 'requestLegacyExternalStorage' not in m:
+              m = m.replace("<application", '<application android:requestLegacyExternalStorage="true"', 1)
+          perms = [
+              "QUERY_ALL_PACKAGES", "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE",
+              "ACCESS_WIFI_STATE", "ACCESS_NETWORK_STATE",
+              "BLUETOOTH", "BLUETOOTH_ADMIN", "BLUETOOTH_CONNECT", "BLUETOOTH_SCAN",
+              "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION"
+          ]
+          ins = "".join(f'    <uses-permission android:name="android.permission.{x}" />\n' for x in perms if f"android.permission.{x}" not in m)
+          if ins:
+              m = m.replace("<application", ins + "    <application", 1)
+          open(mf, "w").write(m)
+          PYEOF
+
+      - name: Compile & Sign Uncompressed APK
         working-directory: ./launcher
         run: |
           chmod +x gradlew
@@ -34,13 +622,12 @@ jobs:
           RAW_APK=$(find app/build/outputs/apk -name "*.apk" | sort | head -n 1)
           BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
           $BUILD_TOOLS/zipalign -f -p 4 "$RAW_APK" aligned.apk
-          keytool -genkey -v -keystore release.keystore -storepass android -alias key -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=TV,O=Android,C=IN"
+          keytool -genkey -v -keystore release.keystore -storepass android -alias releasekey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=TV,O=Android,C=IN"
           mkdir -p ../out_apk
           $BUILD_TOOLS/apksigner sign --ks release.keystore --ks-pass pass:android --key-pass pass:android --out ../out_apk/cleanyourtv-bt.apk aligned.apk
 
-      - name: Upload APK Artifact
+      - name: Upload Fixed All-In-One APK
         uses: actions/upload-artifact@v4
         with:
-          name: CleanYourTV-BottomDock-APK
+          name: CleanYourTV-Fixed-AllInOne-APK
           path: out_apk/cleanyourtv-bt.apk
-          
