@@ -1,5 +1,6 @@
 package com.sparkypro.cleanyourtv
 
+import android.app.Activity
 import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
@@ -15,9 +16,8 @@ import android.view.Gravity
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
-import androidx.fragment.app.FragmentActivity
 
-class MainActivity : FragmentActivity() {
+class MainActivity : Activity() {
 
     private lateinit var statsText: TextView
     private lateinit var statusText: TextView
@@ -33,7 +33,7 @@ class MainActivity : FragmentActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Clean Your TV  •  Mi TV Stick (Android 9)"
+            text = "Clean Your TV • Mi TV Stick (Android 9)"
             textSize = 26f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#38BDF8"))
@@ -55,19 +55,19 @@ class MainActivity : FragmentActivity() {
             setPadding(0, 0, 0, 32)
         }
 
-        val btnBoostRam = createTvButton("🚀  Free Up RAM & Stop Background Apps") {
+        val btnBoostRam = createTvButton("Free Up RAM & Stop Background Apps") {
             boostRam()
         }
 
-        val btnClearCache = createTvButton("🧹  Clear App & Temp Cache") {
+        val btnClearCache = createTvButton("Clear App & Temp Cache") {
             clearLocalCache()
         }
 
-        val btnStorageSettings = createTvButton("💾  Open Android TV Storage & Cached Data") {
+        val btnStorageSettings = createTvButton("Open Android TV Storage & Cached Data") {
             openStorageSettings()
         }
 
-        val btnManageApps = createTvButton("⚙️  Open Installed Apps List (Force Stop / Uninstall)") {
+        val btnManageApps = createTvButton("Open Installed Apps List (Force Stop / Uninstall)") {
             openAppsSettings()
         }
 
@@ -136,7 +136,7 @@ class MainActivity : FragmentActivity() {
         val freedMb = ((afterMem.availMem - beforeMem.availMem) / (1024 * 1024)).coerceAtLeast(0)
 
         statusText.setTextColor(Color.parseColor("#4ADE80"))
-        statusText.text = "✅ Sent stop signal to $killedCount background packages (Freed ~${freedMb} MB RAM)"
+        statusText.text = "Sent stop signal to $killedCount background packages (Freed ~${freedMb} MB RAM)"
         updateStats()
     }
 
@@ -149,7 +149,7 @@ class MainActivity : FragmentActivity() {
             }
         }
         statusText.setTextColor(Color.parseColor("#4ADE80"))
-        statusText.text = "✅ Cleared internal temp cache (${deletedBytes / 1024} KB). Use Storage button below for system-wide cache."
+        statusText.text = "Cleared temp cache (${deletedBytes / 1024} KB). Use Storage button below for system-wide cache."
         updateStats()
     }
 
@@ -179,6 +179,6 @@ class MainActivity : FragmentActivity() {
         val availStorageMb = (stat.availableBlocksLong * stat.blockSizeLong) / (1024 * 1024)
         val totalStorageMb = (stat.blockCountLong * stat.blockSizeLong) / (1024 * 1024)
 
-        statsText.text = "RAM Free: ${availRamMb} MB / ${totalRamMb} MB   |   Storage Free: ${availStorageMb} MB / ${totalStorageMb} MB"
+        statsText.text = "RAM Free: ${availRamMb} MB / ${totalRamMb} MB  |  Storage Free: ${availStorageMb} MB / ${totalStorageMb} MB"
     }
 }
