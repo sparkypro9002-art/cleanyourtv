@@ -1,4 +1,4 @@
-name: Build CleanYourTV APK
+name: Build Original APK
 
 on:
   push:
@@ -24,14 +24,11 @@ jobs:
         with:
           gradle-version: '8.10.2'
 
-      - name: Accept Android SDK Licenses
-        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
-
-      - name: Build Debug APK (Android 9 armeabi-v7a)
-        run: gradle assembleDebug --stacktrace
+      - name: Build Debug APK
+        run: gradle assembleDebug
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: compiled-apk
+          path: "**/*.apk"
